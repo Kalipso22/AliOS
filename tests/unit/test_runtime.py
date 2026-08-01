@@ -1,14 +1,13 @@
-from alios_runtime.runtime import Runtime
+import pytest
+from alios_core.types import RunOutcome
+from alios_runtime import Runtime
 
 
-def test_runtime_emits_lifecycle_events() -> None:
+@pytest.mark.asyncio
+async def test_runtime_executes_async_task() -> None:
     runtime = Runtime()
-    events: list[str] = []
-    for name in ("runtime.started", "runtime.stopping", "runtime.stopped"):
-        runtime.events.subscribe(name, lambda event: events.append(event.name))
-
-    runtime.start()
-    runtime.stop()
-
-    assert events == ["runtime.started", "runtime.stopping", "runtime.stopped"]
-    assert not runtime.is_running
+    await runtime.start()
+    result = await runtime.execute(lambda _: "done")
+    await runtime.stop()
+    await runtime.close()
+    assert result.outcome is RunOutcome.SUCCEEDED and result.value == "done"

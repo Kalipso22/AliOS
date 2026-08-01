@@ -11,9 +11,13 @@ from fastapi import FastAPI
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create and stop the process-local AliOS runtime."""
     runtime = Runtime()
-    runtime.start()
-    app.state.runtime = runtime
     try:
+        await runtime.initialize()
+        await runtime.start()
+        app.state.runtime = runtime
         yield
     finally:
-        runtime.stop()
+        try:
+            await runtime.stop()
+        finally:
+            await runtime.close()
