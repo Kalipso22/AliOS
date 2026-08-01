@@ -122,6 +122,10 @@ class Checkpoint:
             ).encode()
         ).hexdigest()
 
+    def verify_checksum(self) -> bool:
+        """Return whether this immutable checkpoint matches its canonical payload."""
+        return self.checksum == self._checksum()
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "checkpoint_id": str(self.checkpoint_id),
@@ -358,7 +362,7 @@ class CheckpointService:
         return await self.repository.delete_for_run(run_id)
 
     async def verify_checkpoint(self, checkpoint: Checkpoint) -> bool:
-        return checkpoint.checksum == checkpoint._checksum()
+        return checkpoint.verify_checksum()
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,8 +379,6 @@ class RecoveryPlan:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.mode in {RecoveryMode.RESUME, RecoveryMode.RETRY} and self.checkpoint_id is None:
-            raise ValidationError("Recovery mode requires a checkpoint")
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
 
@@ -485,6 +487,17 @@ class RecoveryCoordinator:
                         "reason": "restart_has_checkpoint",
                     },
                 )
+            if plan.target_status is not RunStatus.RUNNING:
+                raise RecoveryPlanStaleError(
+                    "Recovery plan is stale",
+                    {
+                        "run_id": str(plan.run_id),
+                        "recovery_id": plan.recovery_id,
+                        "mode": plan.mode.value,
+                        "reason": "invalid_target_status",
+                        "target_status": plan.target_status.value,
+                    },
+                )
             return None
         if plan.checkpoint_id is None or plan.checkpoint_version is None:
             raise RecoveryPlanStaleError(
@@ -494,6 +507,31 @@ class RecoveryCoordinator:
                     "recovery_id": plan.recovery_id,
                     "mode": plan.mode.value,
                     "reason": "checkpoint_missing",
+                },
+            )
+        if plan.mode is RecoveryMode.RESUME and plan.target_status is not RunStatus.RUNNING:
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "invalid_target_status",
+                    "target_status": plan.target_status.value,
+                },
+            )
+        if plan.mode is RecoveryMode.RETRY and (
+            plan.target_status is not RunStatus.QUEUED or plan.source_status is RunStatus.SUCCEEDED
+        ):
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "invalid_retry_plan",
+                    "target_status": plan.target_status.value,
+                    "source_status": plan.source_status.value,
                 },
             )
         try:
@@ -513,9 +551,7 @@ class RecoveryCoordinator:
             checkpoint.run_id != plan.run_id
             or checkpoint.correlation_id != plan.correlation_id
             or checkpoint.version != plan.checkpoint_version
-            or not await CheckpointService(self.repository, self.run_manager).verify_checkpoint(
-                checkpoint
-            )
+            or not checkpoint.verify_checksum()
         ):
             raise RecoveryPlanStaleError(
                 "Recovery plan is stale",
@@ -586,6 +622,8 @@ class RecoveryCoordinator:
             if plan.run_id in self._active:
                 raise ResourceConflictError("Recovery already active")
             self._active.add(plan.run_id)
+        worker: asyncio.Task[RecoveredPayload] | None = None
+        started_published = False
         try:
             started = self._clock()
             checkpoint = await self._revalidate_plan(plan)
@@ -594,6 +632,7 @@ class RecoveryCoordinator:
                     await self._publisher(
                         RecoveryStarted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
                     )
+                    started_published = True
                 except Exception as error:
                     raise RecoveryStartedPublicationError(
                         "Recovery started publication failed", {"stage": "started"}, error
@@ -661,8 +700,12 @@ class RecoveryCoordinator:
                         "Recovery completed publication failed", {"success": True}, error
                     ) from error
             return result
-        except asyncio.CancelledError:
-            if self._publisher:
+        except asyncio.CancelledError as cancellation:
+            if worker is not None and not worker.done():
+                worker.cancel()
+            if worker is not None:
+                await asyncio.gather(worker, return_exceptions=True)
+            if started_published and self._publisher:
                 try:
                     await self._publisher(
                         self._completed_event(
@@ -670,9 +713,13 @@ class RecoveryCoordinator:
                         )
                     )
                 except Exception:
-                    pass
+                    cancellation.add_note("recovery_completed_publication_failed")
             raise
-        except RecoveryPlanStaleError:
+        except (
+            RecoveryPlanStaleError,
+            RecoveryStartedPublicationError,
+            RecoveryCompletedPublicationError,
+        ):
             raise
         except Exception as error:
             failure = RecoveryFailure(
