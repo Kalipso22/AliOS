@@ -2,6 +2,7 @@ import asyncio
 from datetime import timedelta
 
 import pytest
+from alios_core.errors import RecoveryPlanStaleError
 from alios_core.ids import CorrelationId, RunId
 from alios_core.types import RunStatus
 from alios_runtime.recovery import (
@@ -196,3 +197,35 @@ async def test_recovery_timeout_is_safe(timeout_ms: int) -> None:
         and result.failure is not None
         and result.failure.error_code == "recovery_timeout"
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_plan_missing_checkpoint_releases_reservation() -> None:
+    manager = RunManager()
+    run = await manager.create_run()
+    repository = InMemoryCheckpointRepository()
+    checkpoint = await repository.append(
+        run_id=run.run_id,
+        correlation_id=run.correlation_id,
+        kind=CheckpointKind.PROGRESS,
+        run_status=RunStatus.CREATED,
+        state={},
+    )
+    coordinator = RecoveryCoordinator(repository, manager)
+    plan = await coordinator.create_plan(run.run_id, checkpoint_id=checkpoint.checkpoint_id)
+    await repository.delete(checkpoint.checkpoint_id)
+    with pytest.raises(RecoveryPlanStaleError):
+        await coordinator.recover(plan, lambda *_: RecoveredPayload({}))
+    await repository.append(
+        run_id=run.run_id,
+        correlation_id=run.correlation_id,
+        kind=CheckpointKind.PROGRESS,
+        run_status=RunStatus.CREATED,
+        state={},
+    )
+
+    def restore(checkpoint: Checkpoint | None, _: object) -> RecoveredPayload:
+        assert checkpoint is not None
+        return RecoveredPayload(checkpoint.state)
+
+    assert (await coordinator.recover(await coordinator.create_plan(run.run_id), restore)).success

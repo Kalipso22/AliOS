@@ -17,8 +17,9 @@ from uuid import uuid4
 from alios_core.errors import (
     AliOSError,
     CheckpointError,
-    RecoveryError,
+    RecoveryCompletedPublicationError,
     RecoveryPlanStaleError,
+    RecoveryStartedPublicationError,
     ResourceConflictError,
     SerializationError,
     ValidationError,
@@ -585,16 +586,16 @@ class RecoveryCoordinator:
             if plan.run_id in self._active:
                 raise ResourceConflictError("Recovery already active")
             self._active.add(plan.run_id)
-        started = self._clock()
-        checkpoint = await self._revalidate_plan(plan)
         try:
+            started = self._clock()
+            checkpoint = await self._revalidate_plan(plan)
             if self._publisher:
                 try:
                     await self._publisher(
                         RecoveryStarted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
                     )
                 except Exception as error:
-                    raise RecoveryError(
+                    raise RecoveryStartedPublicationError(
                         "Recovery started publication failed", {"stage": "started"}, error
                     ) from error
 
@@ -635,7 +636,7 @@ class RecoveryCoordinator:
                             )
                         )
                     except Exception as error:
-                        raise RecoveryError(
+                        raise RecoveryCompletedPublicationError(
                             "Recovery completed publication failed", {"success": False}, error
                         ) from error
                 return result
@@ -656,11 +657,20 @@ class RecoveryCoordinator:
                         self._completed_event(plan, success=True, failure_code=None)
                     )
                 except Exception as error:
-                    raise RecoveryError(
+                    raise RecoveryCompletedPublicationError(
                         "Recovery completed publication failed", {"success": True}, error
                     ) from error
             return result
         except asyncio.CancelledError:
+            if self._publisher:
+                try:
+                    await self._publisher(
+                        self._completed_event(
+                            plan, success=False, failure_code="recovery_cancelled"
+                        )
+                    )
+                except Exception:
+                    pass
             raise
         except RecoveryPlanStaleError:
             raise
@@ -685,7 +695,7 @@ class RecoveryCoordinator:
                         self._completed_event(plan, success=False, failure_code=failure.error_code)
                     )
                 except Exception as publication_error:
-                    raise RecoveryError(
+                    raise RecoveryCompletedPublicationError(
                         "Recovery completed publication failed",
                         {"success": False},
                         publication_error,

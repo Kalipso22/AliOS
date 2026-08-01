@@ -62,6 +62,32 @@ async def test_middleware_transforms() -> None:
     assert (await bus.dispatch(BaseEvent())).event.source == "middleware"
 
 
+def test_recovery_completed_success_payload() -> None:
+    from alios_core.events import RecoveryCompleted
+
+    event = RecoveryCompleted(
+        run_id="run",
+        recovery_id="recovery",
+        mode="resume",
+        success=True,
+        checkpoint_id="checkpoint",
+    )
+    assert event.run_id == "run" and event.recovery_id == "recovery" and event.failure_code is None
+
+
+def test_recovery_completed_failure_payload() -> None:
+    from alios_core.events import RecoveryCompleted
+
+    event = RecoveryCompleted(
+        run_id="run",
+        recovery_id="recovery",
+        mode="retry",
+        success=False,
+        failure_code="recovery_failure",
+    )
+    assert not event.success and event.failure_code == "recovery_failure"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("index", range(24))
 async def test_event_history_filters(index: int) -> None:

@@ -60,6 +60,14 @@ class RecoveryPlanStaleError(RecoveryError):
     code = "recovery_plan_stale"
 
 
+class RecoveryStartedPublicationError(RecoveryError):
+    code = "recovery_started_publication_failed"
+
+
+class RecoveryCompletedPublicationError(RecoveryError):
+    code = "recovery_completed_publication_failed"
+
+
 class CheckpointError(AliOSError):
     code = "checkpoint_error"
 
