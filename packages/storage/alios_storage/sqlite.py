@@ -1,0 +1,1 @@
+"""SQLite local storage adapter."""

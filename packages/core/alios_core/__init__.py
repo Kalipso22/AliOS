@@ -1,0 +1,1 @@
+"""Stable AliOS core contracts."""

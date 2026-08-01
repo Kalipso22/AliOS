@@ -1,0 +1,1 @@
+//! Secure desktop secret bridge.

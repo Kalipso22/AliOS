@@ -1,0 +1,1 @@
+"""vLLM adapter placeholder."""

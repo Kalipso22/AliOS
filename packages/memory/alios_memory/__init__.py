@@ -1,0 +1,1 @@
+"""AliOS memory system contracts."""

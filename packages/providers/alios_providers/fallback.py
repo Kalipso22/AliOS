@@ -1,0 +1,1 @@
+"""Compatible provider fallback policy."""

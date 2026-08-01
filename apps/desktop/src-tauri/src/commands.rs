@@ -1,0 +1,1 @@
+//! Validated desktop IPC commands.

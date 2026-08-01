@@ -1,0 +1,1 @@
+{"name":"@alios/web","private":true,"version":"0.1.0","scripts":{"dev":"vite","build":"vite build","lint":"tsc --noEmit","test":"vitest run"}}

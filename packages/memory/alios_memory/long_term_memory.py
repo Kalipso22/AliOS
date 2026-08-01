@@ -1,0 +1,1 @@
+"""Durable memory storage contract."""

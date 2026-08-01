@@ -1,0 +1,1 @@
+{"name":"alios","private":true,"packageManager":"pnpm@9.0.0","scripts":{"lint":"pnpm -r lint","test":"pnpm -r test","build":"pnpm -r build"}}

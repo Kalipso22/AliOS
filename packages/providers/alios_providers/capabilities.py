@@ -1,0 +1,1 @@
+"""Normalized provider capabilities."""

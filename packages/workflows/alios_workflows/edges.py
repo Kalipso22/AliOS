@@ -1,0 +1,1 @@
+"""Workflow edge contracts."""

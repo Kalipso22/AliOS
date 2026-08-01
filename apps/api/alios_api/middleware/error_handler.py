@@ -1,0 +1,1 @@
+"""Stable error response middleware."""

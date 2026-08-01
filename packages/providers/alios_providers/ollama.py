@@ -1,0 +1,1 @@
+"""Ollama adapter placeholder."""
