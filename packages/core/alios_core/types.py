@@ -1,4 +1,5 @@
 """Immutable domain primitives shared by AliOS subsystems."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

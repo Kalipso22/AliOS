@@ -1,4 +1,5 @@
 """Strongly typed UUID identifiers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,7 +20,11 @@ class Identifier:
         return str(self.value)
 
     def __eq__(self, other: object) -> bool:
-        return type(self) is type(other) and isinstance(other, Identifier) and self.value == other.value
+        return (
+            type(self) is type(other)
+            and isinstance(other, Identifier)
+            and self.value == other.value
+        )
 
     def __hash__(self) -> int:
         return hash((type(self), self.value))
@@ -28,18 +33,61 @@ class Identifier:
         return str(self)
 
 
-class RunId(Identifier): pass
-class TaskId(Identifier): pass
-class AgentId(Identifier): pass
-class WorkflowId(Identifier): pass
-class ToolId(Identifier): pass
-class ProviderId(Identifier): pass
-class PluginId(Identifier): pass
-class EventId(Identifier): pass
-class CorrelationId(Identifier): pass
-class TenantId(Identifier): pass
-class UserId(Identifier): pass
-class MemoryId(Identifier): pass
-class ArtifactId(Identifier): pass
-class ScheduleId(Identifier): pass
-class CheckpointId(Identifier): pass
+class RunId(Identifier):
+    pass
+
+
+class TaskId(Identifier):
+    pass
+
+
+class AgentId(Identifier):
+    pass
+
+
+class WorkflowId(Identifier):
+    pass
+
+
+class ToolId(Identifier):
+    pass
+
+
+class ProviderId(Identifier):
+    pass
+
+
+class PluginId(Identifier):
+    pass
+
+
+class EventId(Identifier):
+    pass
+
+
+class CorrelationId(Identifier):
+    pass
+
+
+class TenantId(Identifier):
+    pass
+
+
+class UserId(Identifier):
+    pass
+
+
+class MemoryId(Identifier):
+    pass
+
+
+class ArtifactId(Identifier):
+    pass
+
+
+class ScheduleId(Identifier):
+    pass
+
+
+class CheckpointId(Identifier):
+    pass

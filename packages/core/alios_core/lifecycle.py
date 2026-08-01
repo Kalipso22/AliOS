@@ -1,4 +1,5 @@
 """Service lifecycle contracts."""
+
 from typing import Protocol
 
 

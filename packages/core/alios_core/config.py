@@ -1,4 +1,5 @@
 """Validated configuration contracts."""
+
 from dataclasses import dataclass
 from os import getenv
 

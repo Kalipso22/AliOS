@@ -1,4 +1,5 @@
 """Typed event contracts and in-process event bus."""
+
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
