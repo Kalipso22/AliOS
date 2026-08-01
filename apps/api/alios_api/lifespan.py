@@ -1,4 +1,5 @@
 """Application startup and shutdown lifecycle."""
+
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 

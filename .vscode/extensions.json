@@ -1,1 +1,9 @@
-{"recommendations":["ms-python.python","charliermarsh.ruff","dbaeumer.vscode-eslint","esbenp.prettier-vscode","tauri-apps.tauri-vscode"]}
+{
+  "recommendations": [
+    "ms-python.python",
+    "charliermarsh.ruff",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "tauri-apps.tauri-vscode"
+  ]
+}

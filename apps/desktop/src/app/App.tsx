@@ -1,2 +1,4 @@
 /** Root desktop application shell. */
-export function App() { return null; }
+export function App() {
+  return null;
+}

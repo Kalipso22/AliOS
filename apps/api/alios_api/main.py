@@ -1,4 +1,5 @@
 """FastAPI application composition root."""
+
 from fastapi import FastAPI
 
 from alios_api.lifespan import lifespan

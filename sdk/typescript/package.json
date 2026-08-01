@@ -1,1 +1,11 @@
-{"name":"@alios/sdk","version":"0.1.0","type":"module","scripts":{"build":"tsc -p tsconfig.json","lint":"tsc --noEmit","typecheck":"tsc --noEmit","test":"vitest run"}}
+{
+  "name": "@alios/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}

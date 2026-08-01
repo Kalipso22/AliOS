@@ -1,0 +1,6 @@
+node_modules
+dist
+target
+.venv
+uv.lock
+AGENTS.md

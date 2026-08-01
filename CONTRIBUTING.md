@@ -31,18 +31,18 @@ We welcome contributors at every experience level. The most valuable contributio
 
 ## Ways to Contribute
 
-| Contribution | How it helps |
-|---|---|
-| Bug reports | Turn unclear failures into actionable, reproducible work. |
-| Feature requests | Identify real user needs and missing capabilities. |
-| Documentation | Make AliOS understandable to developers and operators. |
-| Examples | Show practical paths from installation to working systems. |
-| Tutorials | Teach concepts, deployment patterns, and integration practices. |
-| Code | Improve the runtime, SDKs, providers, tools, plugins, and console. |
-| Performance | Reduce latency, cost, memory use, and operational overhead. |
-| Security | Strengthen safe defaults and isolation boundaries. |
-| Testing | Prevent regressions and ensure reliability. |
-| UX | Improve configuration, observability, and control. |
+| Contribution     | How it helps                                                       |
+| ---------------- | ------------------------------------------------------------------ |
+| Bug reports      | Turn unclear failures into actionable, reproducible work.          |
+| Feature requests | Identify real user needs and missing capabilities.                 |
+| Documentation    | Make AliOS understandable to developers and operators.             |
+| Examples         | Show practical paths from installation to working systems.         |
+| Tutorials        | Teach concepts, deployment patterns, and integration practices.    |
+| Code             | Improve the runtime, SDKs, providers, tools, plugins, and console. |
+| Performance      | Reduce latency, cost, memory use, and operational overhead.        |
+| Security         | Strengthen safe defaults and isolation boundaries.                 |
+| Testing          | Prevent regressions and ensure reliability.                        |
+| UX               | Improve configuration, observability, and control.                 |
 
 ### Bug reports
 
@@ -62,13 +62,13 @@ Start a discussion before implementing a large cross-cutting change. This preven
 
 ## Development Environment
 
-| Requirement | Supported version | Purpose |
-|---|---|---|
-| Operating system | Linux, macOS, Windows 11 | Development and local execution |
-| Python | 3.11 or newer | Runtime, SDK, tests, tooling |
-| Node.js | 20 or newer | Console and TypeScript SDK |
-| Docker | Current Engine or Desktop | Local services and full-stack development |
-| Git | 2.40 or newer | Source control and contribution workflow |
+| Requirement      | Supported version         | Purpose                                   |
+| ---------------- | ------------------------- | ----------------------------------------- |
+| Operating system | Linux, macOS, Windows 11  | Development and local execution           |
+| Python           | 3.11 or newer             | Runtime, SDK, tests, tooling              |
+| Node.js          | 20 or newer               | Console and TypeScript SDK                |
+| Docker           | Current Engine or Desktop | Local services and full-stack development |
+| Git              | 2.40 or newer             | Source control and contribution workflow  |
 
 Recommended editors include Visual Studio Code, PyCharm, WebStorm, and any editor with Python, TypeScript, Markdown, Docker, and Git support.
 
@@ -80,79 +80,79 @@ For local model development, install a compatible runtime such as Ollama, LM Stu
 
 Fork Kalipso22/AliOS, then clone your fork and add the upstream remote.
 
-~~~bash
+```bash
 git clone https://github.com/YOUR-GITHUB-USERNAME/AliOS.git
 cd AliOS
 git remote add upstream https://github.com/Kalipso22/AliOS.git
 git fetch upstream
-~~~
+```
 
 ### 2. Create a Python environment
 
 Linux and macOS:
 
-~~~bash
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
-~~~
+```
 
 Windows PowerShell:
 
-~~~powershell
+```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
-~~~
+```
 
 ### 3. Install and run
 
-~~~bash
+```bash
 npm install
 docker compose up --build
-~~~
+```
 
 ### 4. Validate changes
 
-~~~bash
+```bash
 pytest
 ruff check .
 ruff format --check .
 mypy python/alios
 npm run lint
 npm run test
-~~~
+```
 
 Format Python before committing:
 
-~~~bash
+```bash
 ruff format .
 ruff check . --fix
-~~~
+```
 
 ## Branch Strategy
 
-| Branch | Purpose |
-|---|---|
-| main | Stable, reviewed code intended to remain releasable. |
-| develop | Integration branch for upcoming work when maintained by the project. |
-| feature/* | Focused product, runtime, provider, or documentation work. |
-| fix/* | Bug fixes that are not urgent hotfixes. |
-| hotfix/* | High-priority fixes intended for an immediate release. |
-| release/* | Release preparation, validation, versioning, and notes. |
+| Branch    | Purpose                                                              |
+| --------- | -------------------------------------------------------------------- |
+| main      | Stable, reviewed code intended to remain releasable.                 |
+| develop   | Integration branch for upcoming work when maintained by the project. |
+| feature/* | Focused product, runtime, provider, or documentation work.           |
+| fix/*     | Bug fixes that are not urgent hotfixes.                              |
+| hotfix/*  | High-priority fixes intended for an immediate release.               |
+| release/* | Release preparation, validation, versioning, and notes.              |
 
 Use descriptive lowercase branch names separated by hyphens.
 
-~~~text
+```text
 feature/vector-memory-filters
 feature/ollama-streaming-provider
 fix/tool-permission-validation
 hotfix/api-authentication-bypass
 docs/mcp-setup-guide
 release/v0.4.0
-~~~
+```
 
 Keep one logical change per branch. Do not mix formatting sweeps, refactors, features, and unrelated fixes in one pull request.
 
@@ -160,26 +160,26 @@ Keep one logical change per branch. Do not mix formatting sweeps, refactors, fea
 
 AliOS uses Conventional Commits.
 
-~~~text
+```text
 type(optional-scope): concise imperative summary
-~~~
+```
 
-| Type | Use |
-|---|---|
-| feat | New user-visible capability |
-| fix | Bug correction |
-| docs | Documentation-only change |
-| test | Test addition or correction |
+| Type     | Use                                            |
+| -------- | ---------------------------------------------- |
+| feat     | New user-visible capability                    |
+| fix      | Bug correction                                 |
+| docs     | Documentation-only change                      |
+| test     | Test addition or correction                    |
 | refactor | Internal restructuring without behavior change |
-| perf | Measured performance improvement |
-| build | Build system or dependency changes |
-| ci | Continuous integration changes |
-| chore | Maintenance work |
-| security | Security hardening or remediation |
+| perf     | Measured performance improvement               |
+| build    | Build system or dependency changes             |
+| ci       | Continuous integration changes                 |
+| chore    | Maintenance work                               |
+| security | Security hardening or remediation              |
 
 Examples:
 
-~~~text
+```text
 feat(memory): add metadata filtering to semantic retrieval
 feat(mcp): support scoped server capability discovery
 fix(runtime): stop retrying non-retryable tool validation errors
@@ -191,7 +191,7 @@ perf(retrieval): batch embedding requests by provider limit
 build(deps): upgrade the TypeScript SDK toolchain
 ci: run integration tests against local Ollama
 security(tools): require explicit approval for shell execution
-~~~
+```
 
 Use imperative summaries such as add, fix, remove, or document. Keep the first line under 72 characters where practical. Add a body when context, tradeoffs, migration notes, or security rationale are needed.
 
@@ -262,26 +262,26 @@ Required checks normally include unit tests, relevant integration tests, linting
 
 ## Code Review Expectations
 
-| Area | Review question |
-|---|---|
-| Quality | Is the code clear, maintainable, and consistent with local conventions? |
-| Architecture | Does the change preserve modular boundaries and stable contracts? |
-| Security | Are permissions, input validation, secrets, and data boundaries safe? |
-| Performance | Is there measured evidence for a regression or improvement? |
-| Testing | Does the suite cover normal behavior, errors, and regressions? |
-| Documentation | Can users and maintainers operate the changed behavior? |
+| Area          | Review question                                                         |
+| ------------- | ----------------------------------------------------------------------- |
+| Quality       | Is the code clear, maintainable, and consistent with local conventions? |
+| Architecture  | Does the change preserve modular boundaries and stable contracts?       |
+| Security      | Are permissions, input validation, secrets, and data boundaries safe?   |
+| Performance   | Is there measured evidence for a regression or improvement?             |
+| Testing       | Does the suite cover normal behavior, errors, and regressions?          |
+| Documentation | Can users and maintainers operate the changed behavior?                 |
 
 Authors should respond constructively and explain tradeoffs. Reviewers should be specific, kind, and focused on actionable improvements.
 
 ## Testing
 
-| Test type | Purpose |
-|---|---|
-| Unit tests | Verify isolated functions, schemas, policies, and state transitions. |
-| Integration tests | Verify providers, databases, tools, MCP, APIs, and boundaries. |
-| End-to-end tests | Verify realistic workflows through public interfaces. |
-| Evaluation tests | Measure agent quality, grounding, reliability, and safety. |
-| Regression tests | Preserve behavior after discovered defects. |
+| Test type         | Purpose                                                              |
+| ----------------- | -------------------------------------------------------------------- |
+| Unit tests        | Verify isolated functions, schemas, policies, and state transitions. |
+| Integration tests | Verify providers, databases, tools, MCP, APIs, and boundaries.       |
+| End-to-end tests  | Verify realistic workflows through public interfaces.                |
+| Evaluation tests  | Measure agent quality, grounding, reliability, and safety.           |
+| Regression tests  | Preserve behavior after discovered defects.                          |
 
 Write tests for observable behavior, not private implementation details. Every bug fix should include a regression test when feasible. Every feature should test success, invalid input, permissions, failure handling, and compatibility where relevant.
 
@@ -426,4 +426,3 @@ Thank you for helping build AliOS.
 Whether you fix a typo, report a difficult bug, design a plugin, improve a benchmark, or contribute a new agent capability, your work helps make open AI infrastructure more reliable and useful.
 
 Everyone is welcome. Start small, ask thoughtful questions, share what you learn, and build with us.
-

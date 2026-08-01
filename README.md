@@ -78,20 +78,20 @@ AliOS provides Python and TypeScript entry points, a CLI, typed APIs, structured
 
 ## Core Features
 
-| Capability | Description |
-|---|---|
-| Multi-agent architecture | Coordinate specialized agents with roles, shared context, delegation, and boundaries. |
-| Memory system | Persist context, facts, documents, preferences, and execution outcomes. |
-| Planning | Convert high-level goals into explicit, revisable task plans with checkpoints. |
-| Tool calling | Register tools with schemas, validation, permission scopes, and traces. |
-| Local LLM support | Run private workloads with Ollama, LM Studio, llama.cpp, vLLM, or Transformers. |
-| Cloud LLM support | Connect hosted providers through one consistent model interface. |
-| MCP and plugins | Add structured external capabilities without forking core. |
-| RAG and vector memory | Ground responses in documents and retrieve semantically relevant memories. |
-| Workflows and scheduling | Compose automations and trigger them on intervals, cron, events, or queues. |
-| Autonomous execution | Run goal-to-result loops with budgets, approval gates, retries, and stop conditions. |
-| API, GUI, and CLI | Operate AliOS through typed APIs, a browser console, or terminal. |
-| Observability and logging | Capture traces, usage, latency, decisions, tool outcomes, and failures. |
+| Capability                | Description                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------- |
+| Multi-agent architecture  | Coordinate specialized agents with roles, shared context, delegation, and boundaries. |
+| Memory system             | Persist context, facts, documents, preferences, and execution outcomes.               |
+| Planning                  | Convert high-level goals into explicit, revisable task plans with checkpoints.        |
+| Tool calling              | Register tools with schemas, validation, permission scopes, and traces.               |
+| Local LLM support         | Run private workloads with Ollama, LM Studio, llama.cpp, vLLM, or Transformers.       |
+| Cloud LLM support         | Connect hosted providers through one consistent model interface.                      |
+| MCP and plugins           | Add structured external capabilities without forking core.                            |
+| RAG and vector memory     | Ground responses in documents and retrieve semantically relevant memories.            |
+| Workflows and scheduling  | Compose automations and trigger them on intervals, cron, events, or queues.           |
+| Autonomous execution      | Run goal-to-result loops with budgets, approval gates, retries, and stop conditions.  |
+| API, GUI, and CLI         | Operate AliOS through typed APIs, a browser console, or terminal.                     |
+| Observability and logging | Capture traces, usage, latency, decisions, tool outcomes, and failures.               |
 
 ## Architecture Overview
 
@@ -114,41 +114,41 @@ AliOS provides Python and TypeScript entry points, a CLI, typed APIs, structured
 └──────────────┴─┴─────────────┴─┴─────────────┴─┴────────────────────┘
 ```
 
-| Layer | Responsibility |
-|---|---|
-| Core | Shared types, configuration, lifecycle, events, errors, and extension contracts. |
-| Runtime | Loads memory, plans, routes models, executes tools, applies policy, and records traces. |
-| Providers | Adapt LLMs, embeddings, vector DBs, SQL, queues, secrets, and observability. |
-| Memory | Stores sessions, durable facts, documents, embeddings, and run history. |
-| Planner | Turns goals into task graphs, tracks dependencies, and re-plans. |
-| Agents | Role-aware entities with instructions, models, tools, memory rules, and limits. |
-| Tools | Controlled capabilities for files, search, databases, code, messaging, and services. |
-| Models | Explicit selection, fallbacks, policy routing, and local-first inference. |
-| API and frontend | Typed client access and an operational console for status and audit. |
-| Storage | Pluggable metadata, conversation, document, vector, artifact, and audit backends. |
-| Plugins and MCP | Optional capability packages and policy-controlled external integrations. |
+| Layer            | Responsibility                                                                          |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| Core             | Shared types, configuration, lifecycle, events, errors, and extension contracts.        |
+| Runtime          | Loads memory, plans, routes models, executes tools, applies policy, and records traces. |
+| Providers        | Adapt LLMs, embeddings, vector DBs, SQL, queues, secrets, and observability.            |
+| Memory           | Stores sessions, durable facts, documents, embeddings, and run history.                 |
+| Planner          | Turns goals into task graphs, tracks dependencies, and re-plans.                        |
+| Agents           | Role-aware entities with instructions, models, tools, memory rules, and limits.         |
+| Tools            | Controlled capabilities for files, search, databases, code, messaging, and services.    |
+| Models           | Explicit selection, fallbacks, policy routing, and local-first inference.               |
+| API and frontend | Typed client access and an operational console for status and audit.                    |
+| Storage          | Pluggable metadata, conversation, document, vector, artifact, and audit backends.       |
+| Plugins and MCP  | Optional capability packages and policy-controlled external integrations.               |
 
 ## Supported AI Providers
 
-| Provider | Chat / Reasoning | Embeddings | Typical Use |
-|---|---:|---:|---|
-| OpenAI | Yes | Yes | General reasoning, structured output, multimodal workloads |
-| Anthropic | Yes | Via adapter | Long-context analysis and tool use |
-| Google | Yes | Yes | Gemini-based multimodal workflows |
-| OpenRouter | Yes | Provider-dependent | Unified hosted-model access |
-| Groq | Yes | Via adapter | Low-latency hosted inference |
-| DeepSeek | Yes | Via adapter | Reasoning and coding workloads |
-| Ollama | Yes | Yes | Local development and private inference |
-| LM Studio | Yes | Yes | Desktop-hosted model serving |
-| vLLM | Yes | Via adapter | High-throughput self-hosted serving |
-| llama.cpp | Yes | Via adapter | Lightweight local and edge inference |
+| Provider   | Chat / Reasoning |         Embeddings | Typical Use                                                |
+| ---------- | ---------------: | -----------------: | ---------------------------------------------------------- |
+| OpenAI     |              Yes |                Yes | General reasoning, structured output, multimodal workloads |
+| Anthropic  |              Yes |        Via adapter | Long-context analysis and tool use                         |
+| Google     |              Yes |                Yes | Gemini-based multimodal workflows                          |
+| OpenRouter |              Yes | Provider-dependent | Unified hosted-model access                                |
+| Groq       |              Yes |        Via adapter | Low-latency hosted inference                               |
+| DeepSeek   |              Yes |        Via adapter | Reasoning and coding workloads                             |
+| Ollama     |              Yes |                Yes | Local development and private inference                    |
+| LM Studio  |              Yes |                Yes | Desktop-hosted model serving                               |
+| vLLM       |              Yes |        Via adapter | High-throughput self-hosted serving                        |
+| llama.cpp  |              Yes |        Via adapter | Lightweight local and edge inference                       |
 
-| Routing Mode | Behavior |
-|---|---|
-| Explicit | Every run uses the named provider and model. |
-| Fallback | A compatible secondary provider is used after qualifying failure. |
-| Policy-based | Route by sensitivity, latency, budget, capability, or region. |
-| Hybrid | Keep retrieval local while using an approved cloud model for generation. |
+| Routing Mode | Behavior                                                                 |
+| ------------ | ------------------------------------------------------------------------ |
+| Explicit     | Every run uses the named provider and model.                             |
+| Fallback     | A compatible secondary provider is used after qualifying failure.        |
+| Policy-based | Route by sensitivity, latency, budget, capability, or region.            |
+| Hybrid       | Keep retrieval local while using an approved cloud model for generation. |
 
 ## Local AI Support
 
@@ -181,13 +181,13 @@ Reasoning workflows include plan-and-execute, critique-and-revise, retrieval-fir
 
 ## Memory System
 
-| Memory Type | Purpose | Typical Lifetime |
-|---|---|---|
-| Short-term | Conversation, active task state, recent tool output | One run or session |
-| Long-term | Facts, preferences, decisions, and learned outcomes | Persistent |
-| Semantic | Meaning-based records retrieved by similarity | Persistent |
-| Episodic | Past actions, failures, and outcomes | Policy-limited |
-| Working | Planner state, task graph, intermediate artifacts | Active workflow |
+| Memory Type | Purpose                                             | Typical Lifetime   |
+| ----------- | --------------------------------------------------- | ------------------ |
+| Short-term  | Conversation, active task state, recent tool output | One run or session |
+| Long-term   | Facts, preferences, decisions, and learned outcomes | Persistent         |
+| Semantic    | Meaning-based records retrieved by similarity       | Persistent         |
+| Episodic    | Past actions, failures, and outcomes                | Policy-limited     |
+| Working     | Planner state, task graph, intermediate artifacts   | Active workflow    |
 
 Short-term memory is token-budgeted and may be summarized. Long-term memory retains policy-eligible knowledge. Semantic memory stores records with vector embeddings, allowing relevant retrieval even when wording differs.
 
@@ -210,6 +210,7 @@ from alios import AliOS, tool
 
 app = AliOS()
 
+
 @tool(
     name="weather.lookup",
     description="Return current weather for a city.",
@@ -217,6 +218,7 @@ app = AliOS()
 )
 async def get_weather(city: str) -> dict:
     return {"city": city, "condition": "clear", "temperature_c": 24}
+
 
 app.tools.register(get_weather)
 ```
@@ -325,11 +327,13 @@ export ALIOS_OLLAMA_BASE_URL="http://localhost:11434"
 import asyncio
 from alios import Agent, AliOS
 
-app = AliOS(model={
-    "provider": "ollama",
-    "name": "llama3.2",
-    "base_url": "http://localhost:11434",
-})
+app = AliOS(
+    model={
+        "provider": "ollama",
+        "name": "llama3.2",
+        "base_url": "http://localhost:11434",
+    }
+)
 
 researcher = Agent(
     name="researcher",
@@ -337,12 +341,14 @@ researcher = Agent(
     tools=["web.search"],
 )
 
+
 async def main():
     result = await app.run(
         agent=researcher,
         goal="Compare benefits and risks of local AI deployment.",
     )
     print(result.output)
+
 
 asyncio.run(main())
 ```
@@ -352,12 +358,12 @@ alios serve --host 0.0.0.0 --port 8000
 ```
 
 ```ts
-import { AliOSClient } from "@alios/sdk";
+import { AliOSClient } from '@alios/sdk';
 
-const client = new AliOSClient({ baseUrl: "http://localhost:8000" });
+const client = new AliOSClient({ baseUrl: 'http://localhost:8000' });
 const run = await client.runs.create({
-  agent: "researcher",
-  goal: "Summarize the latest project activity.",
+  agent: 'researcher',
+  goal: 'Summarize the latest project activity.',
 });
 
 for await (const event of client.runs.stream(run.id)) {
@@ -492,30 +498,30 @@ AliOS makes secure agent behavior possible; secure deployment still requires del
 
 ## Performance Goals
 
-| Area | Goal |
-|---|---|
+| Area             | Goal                                                                  |
+| ---------------- | --------------------------------------------------------------------- |
 | Runtime overhead | Keep orchestration overhead small relative to model and tool latency. |
-| Streaming | Deliver model and agent events as they are produced. |
-| Tool execution | Support concurrent, policy-controlled independent calls. |
-| Retrieval | Keep common vector retrieval low latency with metadata filters. |
-| Scalability | Run locally for one user or horizontally across workers. |
-| Reliability | Resume durable workloads after transient failures. |
-| Cost control | Track usage and enforce per-run or tenant budgets. |
-| Observability | Trace each significant action by run and correlation ID. |
+| Streaming        | Deliver model and agent events as they are produced.                  |
+| Tool execution   | Support concurrent, policy-controlled independent calls.              |
+| Retrieval        | Keep common vector retrieval low latency with metadata filters.       |
+| Scalability      | Run locally for one user or horizontally across workers.              |
+| Reliability      | Resume durable workloads after transient failures.                    |
+| Cost control     | Track usage and enforce per-run or tenant budgets.                    |
+| Observability    | Trace each significant action by run and correlation ID.              |
 
 ## Benchmarks
 
 Agent benchmarks must include the model, provider, prompts, tools, hardware, dataset, evaluation criteria, and run budget.
 
-| Dimension | What is measured |
-|---|---|
-| Task success | Correctness and completeness |
+| Dimension        | What is measured                                  |
+| ---------------- | ------------------------------------------------- |
+| Task success     | Correctness and completeness                      |
 | Tool reliability | Successful calls, failures, retries, and recovery |
-| Grounding | Evidence support for outputs |
-| Latency | End-to-end and per-stage timing |
-| Cost | Token, model, and tool cost |
-| Safety | Blocked policy violations and approvals |
-| Stability | Variance across repeated controlled runs |
+| Grounding        | Evidence support for outputs                      |
+| Latency          | End-to-end and per-stage timing                   |
+| Cost             | Token, model, and tool cost                       |
+| Safety           | Blocked policy violations and approvals           |
+| Stability        | Variance across repeated controlled runs          |
 | Local efficiency | Memory, throughput, and latency on local hardware |
 
 Never compare benchmark results without their complete configuration.
@@ -656,4 +662,3 @@ Special appreciation goes to the creators and maintainers of Python, TypeScript,
 AliOS is built on a simple belief: AI should be programmable, inspectable, private when needed, and powerful enough to do meaningful work.
 
 Build agents that do more than talk. Build systems that can think, remember, plan, and act.
-

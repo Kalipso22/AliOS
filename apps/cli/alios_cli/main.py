@@ -1,4 +1,5 @@
 """CLI composition root."""
+
 import argparse
 
 from alios_core.config import AliOSConfig

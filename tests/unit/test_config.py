@@ -1,7 +1,8 @@
+import pytest
 from alios_core.config import AliOSConfig
 
 
-def test_configuration_uses_environment(monkeypatch) -> None:
+def test_configuration_uses_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ALIOS_ENVIRONMENT", "test")
     monkeypatch.setenv("ALIOS_LOG_LEVEL", "debug")
 

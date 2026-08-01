@@ -1,4 +1,5 @@
 """Logging bootstrap for AliOS processes."""
+
 import logging
 
 

@@ -1,1 +1,23 @@
-{"name":"alios","private":true,"packageManager":"pnpm@9.0.0","scripts":{"build":"pnpm -r build","lint":"pnpm -r lint","format":"prettier --write .","format:check":"prettier --check .","test":"pnpm -r test","typecheck":"pnpm -r typecheck"},"devDependencies":{"@eslint/js":"^9.18.0","@types/node":"^22.10.5","eslint":"^9.18.0","prettier":"^3.4.2","typescript":"^5.7.2","typescript-eslint":"^8.19.1","vite":"^6.0.5","vitest":"^2.1.8"}}
+{
+  "name": "alios",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/node": "^22.10.5",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.1",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}
