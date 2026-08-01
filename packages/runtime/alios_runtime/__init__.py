@@ -16,6 +16,7 @@ from .recovery import (
     InMemoryCheckpointRepository,
     RecoveredPayload,
     RecoveryCoordinator,
+    RecoveryFailure,
     RecoveryMode,
     RecoveryPlan,
     RecoveryResult,
@@ -28,7 +29,13 @@ from .run_manager import (
     RunRecord,
     RunRepository,
 )
-from .runtime import Runtime, RuntimeExecutionResult, RuntimeOptions, RuntimeTask
+from .runtime import (
+    Runtime,
+    RuntimeExecutionResult,
+    RuntimeOptions,
+    RuntimePolicyRequest,
+    RuntimeTask,
+)
 from .state_machine import RunStateMachine, RunTransition
 
 __all__ = [
@@ -50,12 +57,14 @@ __all__ = [
     "InMemoryCheckpointRepository",
     "RecoveredPayload",
     "RecoveryCoordinator",
+    "RecoveryFailure",
     "RecoveryMode",
     "RecoveryPlan",
     "RecoveryResult",
     "Runtime",
     "RuntimeExecutionResult",
     "RuntimeOptions",
+    "RuntimePolicyRequest",
     "RuntimeTask",
     "bind_execution_context",
     "current_execution_context",

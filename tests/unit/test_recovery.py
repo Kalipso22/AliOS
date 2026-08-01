@@ -143,3 +143,26 @@ async def test_recovery_modes_are_isolated(mode: RecoveryMode, index: int) -> No
         ),
     )
     assert result.success
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["failure", "bad input", "interrupted", "invalid", "retryable"])
+async def test_recovery_normalizes_restorer_failures(message: str) -> None:
+    manager = RunManager()
+    run = await manager.create_run()
+    repository = InMemoryCheckpointRepository()
+    await repository.append(
+        run_id=run.run_id,
+        correlation_id=run.correlation_id,
+        kind=CheckpointKind.PROGRESS,
+        run_status=RunStatus.CREATED,
+        state={},
+    )
+    coordinator = RecoveryCoordinator(repository, manager)
+    plan = await coordinator.create_plan(run.run_id)
+
+    def broken(*_: object) -> RecoveredPayload:
+        raise RuntimeError(message)
+
+    result = await coordinator.recover(plan, broken)
+    assert not result.success and result.failure is not None and result.recovered_state is None

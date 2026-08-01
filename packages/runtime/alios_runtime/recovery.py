@@ -12,8 +12,10 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol
+from uuid import uuid4
 
 from alios_core.errors import (
+    AliOSError,
     CheckpointError,
     ResourceConflictError,
     SerializationError,
@@ -383,12 +385,19 @@ class RecoveryFailure:
     retryable: bool = False
     occurred_at: datetime = field(default_factory=utc_now)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", _freeze(self.details))
+
 
 @dataclass(frozen=True, slots=True)
 class RecoveredPayload:
     state: Mapping[str, Any]
     execution_context: ExecutionContext | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state", _freeze(_json(self.state)))
+        object.__setattr__(self, "metadata", _freeze(_json(self.metadata)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +411,19 @@ class RecoveryResult:
     duration: timedelta
     failure: RecoveryFailure | None = None
     warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.duration < timedelta():
+            raise ValidationError("Recovery duration cannot be negative")
+        if self.success != (self.failure is None):
+            raise ValidationError("Recovery result success and failure are inconsistent")
+        if not self.success and (
+            self.recovered_state is not None or self.recovered_context is not None
+        ):
+            raise ValidationError("Failed recovery cannot expose recovered payload")
+        if self.recovered_state is not None:
+            object.__setattr__(self, "recovered_state", _freeze(_json(self.recovered_state)))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
 
 
 class RecoveryCoordinator:
@@ -440,7 +462,7 @@ class RecoveryCoordinator:
         ):
             raise CheckpointError("Checkpoint does not belong to run")
         return RecoveryPlan(
-            str(__import__("uuid").uuid4()),
+            str(uuid4()),
             run_id,
             run.correlation_id,
             checkpoint.checkpoint_id if checkpoint else None,
@@ -477,6 +499,28 @@ class RecoveryCoordinator:
                 started,
                 self._clock(),
                 self._clock() - started,
+            )
+            if self._publisher:
+                await self._publisher(
+                    RecoveryCompleted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
+                )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failure = RecoveryFailure(
+                error.code if isinstance(error, AliOSError) else "recovery_failure",
+                error.message if isinstance(error, AliOSError) else "Recovery failed",
+            )
+            result = RecoveryResult(
+                plan,
+                False,
+                None,
+                None,
+                started,
+                self._clock(),
+                self._clock() - started,
+                failure,
             )
             if self._publisher:
                 await self._publisher(
