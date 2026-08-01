@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from alios_core.errors import (
     AliOSError,
     CheckpointError,
+    RecoveryError,
     ResourceConflictError,
     SerializationError,
     ValidationError,
@@ -433,11 +434,15 @@ class RecoveryCoordinator:
         run_manager: RunManager,
         event_publisher: Callable[[BaseEvent], Awaitable[object]] | None = None,
         clock: Callable[[], datetime] = utc_now,
+        default_timeout: timedelta | None = None,
     ) -> None:
         self.repository = repository
         self.run_manager = run_manager
         self._publisher = event_publisher
         self._clock = clock
+        if default_timeout is not None and default_timeout < timedelta():
+            raise ValidationError("Recovery timeout cannot be negative")
+        self.default_timeout = default_timeout
         self._active: set[RunId] = set()
         self._lock = asyncio.Lock()
 
@@ -474,7 +479,11 @@ class RecoveryCoordinator:
         )
 
     async def recover(
-        self, plan: RecoveryPlan, restore: Callable[[Checkpoint | None, RecoveryPlan], Any]
+        self,
+        plan: RecoveryPlan,
+        restore: Callable[[Checkpoint | None, RecoveryPlan], Any],
+        *,
+        timeout: timedelta | None = None,
     ) -> RecoveryResult:
         async with self._lock:
             if plan.run_id in self._active:
@@ -484,11 +493,56 @@ class RecoveryCoordinator:
         checkpoint = await self.repository.get(plan.checkpoint_id) if plan.checkpoint_id else None
         try:
             if self._publisher:
-                await self._publisher(
-                    RecoveryStarted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
+                try:
+                    await self._publisher(
+                        RecoveryStarted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
+                    )
+                except Exception as error:
+                    raise RecoveryError(
+                        "Recovery started publication failed", {"stage": "started"}, error
+                    ) from error
+
+            async def invoke() -> RecoveredPayload:
+                value = restore(checkpoint, plan)
+                return cast(RecoveredPayload, await value if inspect.isawaitable(value) else value)
+
+            effective = timeout if timeout is not None else self.default_timeout
+            if effective is not None and effective < timedelta():
+                raise ValidationError("Recovery timeout cannot be negative")
+            worker = asyncio.create_task(invoke())
+            try:
+                payload = (
+                    await asyncio.wait_for(worker, effective.total_seconds())
+                    if effective is not None
+                    else await worker
                 )
-            value = restore(checkpoint, plan)
-            payload = await value if inspect.isawaitable(value) else value
+            except TimeoutError:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+                payload = None
+                failure = RecoveryFailure("recovery_timeout", "Recovery restoration timed out")
+                result = RecoveryResult(
+                    plan,
+                    False,
+                    None,
+                    None,
+                    started,
+                    self._clock(),
+                    self._clock() - started,
+                    failure,
+                )
+                if self._publisher:
+                    try:
+                        await self._publisher(
+                            RecoveryCompleted(
+                                correlation_id=plan.correlation_id, run_id=str(plan.run_id)
+                            )
+                        )
+                    except Exception as error:
+                        raise RecoveryError(
+                            "Recovery completed publication failed", {"success": False}, error
+                        ) from error
+                return result
             if not isinstance(payload, RecoveredPayload):
                 raise ValidationError("Restorer must return RecoveredPayload")
             result = RecoveryResult(
@@ -501,9 +555,16 @@ class RecoveryCoordinator:
                 self._clock() - started,
             )
             if self._publisher:
-                await self._publisher(
-                    RecoveryCompleted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
-                )
+                try:
+                    await self._publisher(
+                        RecoveryCompleted(
+                            correlation_id=plan.correlation_id, run_id=str(plan.run_id)
+                        )
+                    )
+                except Exception as error:
+                    raise RecoveryError(
+                        "Recovery completed publication failed", {"success": True}, error
+                    ) from error
             return result
         except asyncio.CancelledError:
             raise
@@ -523,9 +584,18 @@ class RecoveryCoordinator:
                 failure,
             )
             if self._publisher:
-                await self._publisher(
-                    RecoveryCompleted(correlation_id=plan.correlation_id, run_id=str(plan.run_id))
-                )
+                try:
+                    await self._publisher(
+                        RecoveryCompleted(
+                            correlation_id=plan.correlation_id, run_id=str(plan.run_id)
+                        )
+                    )
+                except Exception as publication_error:
+                    raise RecoveryError(
+                        "Recovery completed publication failed",
+                        {"success": False},
+                        publication_error,
+                    ) from publication_error
             return result
         finally:
             async with self._lock:

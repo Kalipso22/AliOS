@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 
 import pytest
 from alios_core.ids import CorrelationId, RunId
@@ -166,3 +167,32 @@ async def test_recovery_normalizes_restorer_failures(message: str) -> None:
 
     result = await coordinator.recover(plan, broken)
     assert not result.success and result.failure is not None and result.recovered_state is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_ms", range(1, 21))
+async def test_recovery_timeout_is_safe(timeout_ms: int) -> None:
+    manager = RunManager()
+    run = await manager.create_run()
+    repository = InMemoryCheckpointRepository()
+    await repository.append(
+        run_id=run.run_id,
+        correlation_id=run.correlation_id,
+        kind=CheckpointKind.PROGRESS,
+        run_status=RunStatus.CREATED,
+        state={},
+    )
+    coordinator = RecoveryCoordinator(
+        repository, manager, default_timeout=timedelta(milliseconds=timeout_ms)
+    )
+
+    async def slow(*_: object) -> RecoveredPayload:
+        await asyncio.Event().wait()
+        return RecoveredPayload({})
+
+    result = await coordinator.recover(await coordinator.create_plan(run.run_id), slow)
+    assert (
+        not result.success
+        and result.failure is not None
+        and result.failure.error_code == "recovery_timeout"
+    )

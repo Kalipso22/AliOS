@@ -11,6 +11,7 @@ from typing import Any, Generic, Protocol, TypeVar
 
 from alios_core.errors import (
     PermissionDeniedError,
+    RecoveryError,
     ResourceConflictError,
     ValidationError,
 )
@@ -166,9 +167,23 @@ class Runtime(ManagedLifecycleComponent):
     async def _stop(self) -> None:
         self._accepting = False
         async with self._active_lock:
-            tasks = tuple(item.task for item in self._active.values())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            active = tuple(self._active.values())
+        tasks = tuple(item.task for item in active)
+        if tasks and self.options.drain_on_shutdown:
+            _, pending = await asyncio.wait(
+                tasks, timeout=self.options.shutdown_timeout.total_seconds()
+            )
+            if pending and not self.options.cancel_on_shutdown_timeout:
+                raise ValidationError("Runtime shutdown timed out", {"pending_runs": len(pending)})
+            active = tuple(item for item in active if item.task in pending)
+        if active:
+            for item in active:
+                item.cancellation_token.cancel("runtime_shutdown")
+                item.task.cancel()
+            await asyncio.wait(
+                tuple(item.task for item in active),
+                timeout=self.options.cancellation_grace_period.total_seconds(),
+            )
         if self._owns_event_bus:
             await self.events.stop()
 
@@ -437,6 +452,65 @@ class Runtime(ManagedLifecycleComponent):
         return await self.recovery.create_plan(run_id, mode=mode)
 
     async def recover(
-        self, plan: RecoveryPlan, restore: Callable[[object, RecoveryPlan], object]
+        self,
+        plan: RecoveryPlan,
+        restore: Callable[[object, RecoveryPlan], object],
+        *,
+        timeout: timedelta | None = None,
     ) -> RecoveryResult:
-        return await self.recovery.recover(plan, restore)
+        return await self.recovery.recover(plan, restore, timeout=timeout)
+
+    async def recover_and_execute(
+        self,
+        plan: RecoveryPlan,
+        restore: Callable[[object, RecoveryPlan], object],
+        task: Callable[[ExecutionContext], T | Awaitable[T]],
+        *,
+        policy_request: RuntimePolicyRequest | None = None,
+        timeout: timedelta | None = None,
+    ) -> RuntimeExecutionResult[T]:
+        recovered = await self.recover(plan, restore, timeout=timeout)
+        if not recovered.success or recovered.recovered_context is None:
+            raise RecoveryError(
+                "Recovery blocked execution",
+                {"failure_code": recovered.failure.error_code if recovered.failure else "unknown"},
+            )
+        if plan.mode is RecoveryMode.RESUME and plan.source_status in {
+            RunStatus.CREATED,
+            RunStatus.QUEUED,
+        }:
+            result = await self.execute_existing(
+                plan.run_id,
+                task,
+                context=recovered.recovered_context,
+                policy_request=policy_request,
+                timeout=timeout,
+                checkpoint_state=recovered.recovered_state,
+            )
+        else:
+            context = (
+                recovered.recovered_context.create_child()
+                if plan.mode is not RecoveryMode.RESTART
+                else ExecutionContext.create(correlation_id=plan.correlation_id)
+            )
+            result = await self.execute(
+                task,
+                context=context,
+                policy_request=policy_request,
+                timeout=timeout,
+                checkpoint_state={}
+                if plan.mode is RecoveryMode.RESTART
+                else recovered.recovered_state,
+            )
+        return RuntimeExecutionResult(
+            result.run,
+            result.outcome,
+            result.value,
+            result.failure,
+            result.correlation_id,
+            result.started_at,
+            result.completed_at,
+            result.duration,
+            result.checkpoint_ids,
+            recovered,
+        )

@@ -85,3 +85,14 @@ async def test_execute_existing_does_not_duplicate_run() -> None:
     await runtime.stop()
     await runtime.close()
     assert result.run.run_id == run.run_id and await runtime.run_manager.repository.count() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", range(20))
+async def test_runtime_shutdown_drains_completed_executions(value: int) -> None:
+    runtime = Runtime()
+    await runtime.start()
+    result = await runtime.execute(lambda _: value)
+    await runtime.stop()
+    await runtime.close()
+    assert result.value == value and await runtime.active_count() == 0
