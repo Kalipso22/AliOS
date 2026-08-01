@@ -1,1 +1,1 @@
-{"name":"@alios/desktop","private":true,"version":"0.1.0","scripts":{"dev":"vite","build":"vite build","lint":"tsc --noEmit","test":"vitest run"}}
+{"name":"@alios/desktop","private":true,"version":"0.1.0","scripts":{"dev":"vite","build":"tsc -p tsconfig.json && vite build","lint":"tsc --noEmit","typecheck":"tsc --noEmit","test":"vitest run"}}
