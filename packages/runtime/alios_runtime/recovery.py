@@ -18,6 +18,7 @@ from alios_core.errors import (
     AliOSError,
     CheckpointError,
     RecoveryError,
+    RecoveryPlanStaleError,
     ResourceConflictError,
     SerializationError,
     ValidationError,
@@ -446,6 +447,101 @@ class RecoveryCoordinator:
         self._active: set[RunId] = set()
         self._lock = asyncio.Lock()
 
+    async def _revalidate_plan(self, plan: RecoveryPlan) -> Checkpoint | None:
+        try:
+            run = await self.run_manager.get_run(plan.run_id)
+        except Exception as error:
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "run_missing",
+                },
+                error,
+            ) from error
+        if run.correlation_id != plan.correlation_id or run.status is not plan.source_status:
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "run_changed",
+                    "expected_source_status": plan.source_status.value,
+                    "actual_source_status": run.status.value,
+                },
+            )
+        if plan.mode is RecoveryMode.RESTART:
+            if plan.checkpoint_id is not None or plan.checkpoint_version is not None:
+                raise RecoveryPlanStaleError(
+                    "Recovery plan is stale",
+                    {
+                        "run_id": str(plan.run_id),
+                        "recovery_id": plan.recovery_id,
+                        "mode": plan.mode.value,
+                        "reason": "restart_has_checkpoint",
+                    },
+                )
+            return None
+        if plan.checkpoint_id is None or plan.checkpoint_version is None:
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "checkpoint_missing",
+                },
+            )
+        try:
+            checkpoint = await self.repository.get(plan.checkpoint_id)
+        except Exception as error:
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "checkpoint_missing",
+                },
+                error,
+            ) from error
+        if (
+            checkpoint.run_id != plan.run_id
+            or checkpoint.correlation_id != plan.correlation_id
+            or checkpoint.version != plan.checkpoint_version
+            or not await CheckpointService(self.repository, self.run_manager).verify_checkpoint(
+                checkpoint
+            )
+        ):
+            raise RecoveryPlanStaleError(
+                "Recovery plan is stale",
+                {
+                    "run_id": str(plan.run_id),
+                    "recovery_id": plan.recovery_id,
+                    "mode": plan.mode.value,
+                    "reason": "checkpoint_changed",
+                    "expected_checkpoint_version": plan.checkpoint_version,
+                    "actual_checkpoint_version": checkpoint.version,
+                },
+            )
+        return checkpoint
+
+    def _completed_event(
+        self, plan: RecoveryPlan, *, success: bool, failure_code: str | None
+    ) -> RecoveryCompleted:
+        return RecoveryCompleted(
+            correlation_id=plan.correlation_id,
+            run_id=str(plan.run_id),
+            recovery_id=plan.recovery_id,
+            mode=plan.mode.value,
+            success=success,
+            failure_code=failure_code,
+            checkpoint_id=str(plan.checkpoint_id) if plan.checkpoint_id else None,
+        )
+
     async def create_plan(
         self,
         run_id: RunId,
@@ -490,7 +586,7 @@ class RecoveryCoordinator:
                 raise ResourceConflictError("Recovery already active")
             self._active.add(plan.run_id)
         started = self._clock()
-        checkpoint = await self.repository.get(plan.checkpoint_id) if plan.checkpoint_id else None
+        checkpoint = await self._revalidate_plan(plan)
         try:
             if self._publisher:
                 try:
@@ -534,8 +630,8 @@ class RecoveryCoordinator:
                 if self._publisher:
                     try:
                         await self._publisher(
-                            RecoveryCompleted(
-                                correlation_id=plan.correlation_id, run_id=str(plan.run_id)
+                            self._completed_event(
+                                plan, success=False, failure_code="recovery_timeout"
                             )
                         )
                     except Exception as error:
@@ -557,9 +653,7 @@ class RecoveryCoordinator:
             if self._publisher:
                 try:
                     await self._publisher(
-                        RecoveryCompleted(
-                            correlation_id=plan.correlation_id, run_id=str(plan.run_id)
-                        )
+                        self._completed_event(plan, success=True, failure_code=None)
                     )
                 except Exception as error:
                     raise RecoveryError(
@@ -567,6 +661,8 @@ class RecoveryCoordinator:
                     ) from error
             return result
         except asyncio.CancelledError:
+            raise
+        except RecoveryPlanStaleError:
             raise
         except Exception as error:
             failure = RecoveryFailure(
@@ -586,9 +682,7 @@ class RecoveryCoordinator:
             if self._publisher:
                 try:
                     await self._publisher(
-                        RecoveryCompleted(
-                            correlation_id=plan.correlation_id, run_id=str(plan.run_id)
-                        )
+                        self._completed_event(plan, success=False, failure_code=failure.error_code)
                     )
                 except Exception as publication_error:
                     raise RecoveryError(

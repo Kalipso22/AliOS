@@ -56,6 +56,10 @@ class RecoveryError(AliOSError):
     code = "recovery_error"
 
 
+class RecoveryPlanStaleError(RecoveryError):
+    code = "recovery_plan_stale"
+
+
 class CheckpointError(AliOSError):
     code = "checkpoint_error"
 

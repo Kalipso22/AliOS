@@ -99,6 +99,11 @@ class RecoveryStarted(BaseEvent):
 @dataclass(frozen=True, slots=True)
 class RecoveryCompleted(BaseEvent):
     run_id: str = ""
+    recovery_id: str = ""
+    mode: str = ""
+    success: bool = False
+    failure_code: str | None = None
+    checkpoint_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
