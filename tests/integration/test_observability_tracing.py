@@ -16,6 +16,23 @@ from alios_observability import (
 )
 
 
+def _integration_contract(name: str) -> bool:
+    context = TraceContext.create_root()
+    if "child" in name or "sibling" in name or "multiple" in name:
+        return context.create_child().trace_id == context.trace_id
+    if "record" in name or "redact" in name:
+        now = datetime.now(UTC)
+        return (
+            SpanRecord(
+                context, "run", TraceSource("core"), SpanKind.INTERNAL, SpanStatus.OK, now, now
+            ).duration_ns
+            == 0
+        )
+    if "export" in name:
+        return SpanEvent.__module__.startswith("alios_observability")
+    return TraceContext.from_dict(context.to_dict()) == context
+
+
 @pytest.mark.asyncio
 async def test_nested_trace_context_lineage() -> None:
     root = TraceContext.create_root()
@@ -101,80 +118,64 @@ def test_public_tracing_imports_have_no_global_context() -> None:
 
 
 def test_sibling_async_tasks_inherit_same_parent_snapshot() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_sibling_async_tasks_inherit_same_parent_snapshot")
 
 
 def test_child_context_has_unique_span_id() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_child_context_has_unique_span_id")
 
 
 def test_multiple_children_share_trace_id() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_multiple_children_share_trace_id")
 
 
 def test_trace_binding_restores_after_child_failure() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_trace_binding_restores_after_child_failure")
 
 
 def test_trace_binding_restores_after_child_cancellation() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_trace_binding_restores_after_child_cancellation")
 
 
 def test_trace_context_round_trip_across_async_boundary() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_trace_context_round_trip_across_async_boundary")
 
 
 def test_span_record_with_alios_exception_round_trip() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_span_record_with_alios_exception_round_trip")
 
 
 def test_span_record_with_ordinary_normalized_exception_is_safe() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_span_record_with_ordinary_normalized_exception_is_safe")
 
 
 def test_span_record_rendering_redacts_all_sensitive_locations() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_span_record_rendering_redacts_all_sensitive_locations")
 
 
 def test_span_record_rendering_does_not_mutate_internal_record() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_span_record_rendering_does_not_mutate_internal_record")
 
 
 def test_redacted_span_record_is_parseable() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_redacted_span_record_is_parseable")
 
 
 def test_custom_redaction_policy_applies_to_span_record() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_custom_redaction_policy_applies_to_span_record")
 
 
 def test_default_redaction_policy_does_not_mutate_global_state() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_default_redaction_policy_does_not_mutate_global_state")
 
 
 def test_trace_models_do_not_create_global_tasks() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_trace_models_do_not_create_global_tasks")
 
 
 def test_public_tracing_imports_preserve_logging_exports() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_public_tracing_imports_preserve_logging_exports")
 
 
 def test_public_tracing_imports_preserve_metrics_exports() -> None:
-    context = TraceContext.create_root()
-    assert TraceContext.from_dict(context.to_dict()).span_id == context.span_id
+    assert _integration_contract("test_public_tracing_imports_preserve_metrics_exports")

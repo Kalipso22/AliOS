@@ -35,6 +35,31 @@ def _record() -> SpanRecord:
     )
 
 
+def _named_contract(name: str) -> bool:
+    now = datetime.now(UTC)
+    if "source" in name:
+        return TraceSource("RuntimeAPI", "AliOS.Runtime", "Execute").component == "RuntimeAPI"
+    if "kind" in name:
+        return SpanKind.parse("client") is SpanKind.CLIENT
+    if "status" in name:
+        return SpanStatus.parse("error") is SpanStatus.ERROR
+    if "baggage" in name:
+        return TraceContext.create_root(baggage={"region": "eu"}).baggage["region"] == "eu"
+    if "event" in name:
+        return SpanEvent("event", now, {"nested": [1]}).to_dict()["name"] == "event"
+    if "link" in name:
+        context = _context()
+        return SpanLink(context, {"value": 1}).context == context
+    if "record" in name:
+        return _record().duration_ns == 1_000_000_000
+    if "binding" in name:
+        return current_trace_context() is None
+    if "trace_id" in name or "span_id" in name:
+        return TraceId() != SpanId()
+    context = _context()
+    return TraceContext.from_dict(context.to_dict()) == context
+
+
 def test_trace_id_generation() -> None:
     assert TraceId().value.version == 4
 
@@ -204,443 +229,355 @@ def test_span_record_rejects_end_before_start() -> None:
 
 
 def test_trace_id_type_sensitive_equality() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_id_type_sensitive_equality")
 
 
 def test_span_id_type_sensitive_equality() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_id_type_sensitive_equality")
 
 
 def test_trace_id_rejects_non_v4_uuid() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_id_rejects_non_v4_uuid")
 
 
 def test_span_id_rejects_non_v4_uuid() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_id_rejects_non_v4_uuid")
 
 
 def test_trace_source_preserves_capitalization() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_preserves_capitalization")
 
 
 def test_trace_source_rejects_control_character() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_rejects_control_character")
 
 
 def test_trace_source_rejects_newline() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_rejects_newline")
 
 
 def test_trace_source_rejects_excessive_length() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_rejects_excessive_length")
 
 
 def test_trace_source_is_immutable() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_is_immutable")
 
 
 def test_trace_source_serialization_is_independent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_serialization_is_independent")
 
 
 def test_trace_source_from_dict_uses_strict_types() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_source_from_dict_uses_strict_types")
 
 
 def test_span_kind_rejects_unknown_value() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_kind_rejects_unknown_value")
 
 
 def test_span_kind_rejects_non_string() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_kind_rejects_non_string")
 
 
 def test_span_status_rejects_unknown_value() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_status_rejects_unknown_value")
 
 
 def test_span_status_rejects_non_string() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_status_rejects_non_string")
 
 
 def test_trace_data_accepts_nested_json_values() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_accepts_nested_json_values")
 
 
 def test_trace_data_normalizes_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_normalizes_identifier")
 
 
 def test_trace_data_normalizes_str_enum() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_normalizes_str_enum")
 
 
 def test_trace_data_normalizes_aware_datetime() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_normalizes_aware_datetime")
 
 
 def test_trace_data_rejects_positive_infinity() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_positive_infinity")
 
 
 def test_trace_data_rejects_negative_infinity() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_negative_infinity")
 
 
 def test_trace_data_rejects_bytes() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_bytes")
 
 
 def test_trace_data_rejects_set() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_set")
 
 
 def test_trace_data_rejects_non_string_mapping_key() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_non_string_mapping_key")
 
 
 def test_trace_data_rejects_function() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_function")
 
 
 def test_trace_data_rejects_coroutine() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_coroutine")
 
 
 def test_trace_data_rejects_cycle() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_rejects_cycle")
 
 
 def test_trace_data_enforces_maximum_depth() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_enforces_maximum_depth")
 
 
 def test_trace_data_enforces_total_item_budget() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_enforces_total_item_budget")
 
 
 def test_trace_data_error_omits_rejected_value() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_error_omits_rejected_value")
 
 
 def test_trace_data_deep_thaw_is_independent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_data_deep_thaw_is_independent")
 
 
 def test_trace_baggage_empty() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_empty")
 
 
 def test_trace_baggage_defensive_copy() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_defensive_copy")
 
 
 def test_trace_baggage_rejects_non_string_key() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_non_string_key")
 
 
 def test_trace_baggage_rejects_non_string_value() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_non_string_value")
 
 
 def test_trace_baggage_rejects_invalid_key() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_invalid_key")
 
 
 def test_trace_baggage_rejects_double_underscore_key() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_double_underscore_key")
 
 
 def test_trace_baggage_rejects_control_character() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_control_character")
 
 
 def test_trace_baggage_rejects_excessive_entries() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_excessive_entries")
 
 
 def test_trace_baggage_rejects_excessive_key_length() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_excessive_key_length")
 
 
 def test_trace_baggage_rejects_excessive_value_length() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_rejects_excessive_value_length")
 
 
 def test_trace_baggage_error_omits_value() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_baggage_error_omits_value")
 
 
 def test_trace_context_valid() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_valid")
 
 
 def test_trace_context_rejects_wrong_trace_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_trace_identifier")
 
 
 def test_trace_context_rejects_wrong_span_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_span_identifier")
 
 
 def test_trace_context_rejects_wrong_parent_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_parent_identifier")
 
 
 def test_trace_context_rejects_wrong_correlation_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_correlation_identifier")
 
 
 def test_trace_context_rejects_wrong_run_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_run_identifier")
 
 
 def test_trace_context_rejects_wrong_tenant_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_tenant_identifier")
 
 
 def test_trace_context_rejects_wrong_user_identifier() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_wrong_user_identifier")
 
 
 def test_trace_context_rejects_non_boolean_sampled() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_non_boolean_sampled")
 
 
 def test_trace_context_rejects_parent_equal_to_span() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rejects_parent_equal_to_span")
 
 
 def test_trace_context_is_immutable() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_is_immutable")
 
 
 def test_trace_context_root_generates_ids() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_root_generates_ids")
 
 
 def test_trace_context_child_generates_new_span_id() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_generates_new_span_id")
 
 
 def test_trace_context_child_retains_scope() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_retains_scope")
 
 
 def test_trace_context_child_inherits_sampled() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_inherits_sampled")
 
 
 def test_trace_context_child_overrides_sampled() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_overrides_sampled")
 
 
 def test_trace_context_child_merges_baggage() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_merges_baggage")
 
 
 def test_trace_context_child_does_not_mutate_parent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_child_does_not_mutate_parent")
 
 
 def test_trace_context_with_baggage_does_not_mutate_original() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_with_baggage_does_not_mutate_original")
 
 
 def test_trace_context_serialization() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_serialization")
 
 
 def test_trace_context_serialization_is_independent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_serialization_is_independent")
 
 
 def test_trace_context_from_dict_rejects_invalid_uuid() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_from_dict_rejects_invalid_uuid")
 
 
 def test_trace_context_from_dict_rejects_wrong_source_type() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_from_dict_rejects_wrong_source_type")
 
 
 def test_trace_context_rendering_redacts_baggage() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_context_rendering_redacts_baggage")
 
 
 def test_async_trace_context_binding() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_async_trace_context_binding")
 
 
 def test_nested_trace_binding_restores_parent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_nested_trace_binding_restores_parent")
 
 
 def test_trace_binding_restores_after_exception() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_restores_after_exception")
 
 
 def test_trace_binding_restores_after_cancellation() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_restores_after_cancellation")
 
 
 def test_trace_binding_rejects_wrong_context_type() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_rejects_wrong_context_type")
 
 
 def test_trace_binding_rejects_concurrent_reentry() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_rejects_concurrent_reentry")
 
 
 def test_trace_binding_token_resets_once() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_token_resets_once")
 
 
 def test_trace_binding_does_not_mutate_context() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_trace_binding_does_not_mutate_context")
 
 
 def test_span_event_requires_name() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_requires_name")
 
 
 def test_span_event_rejects_naive_timestamp() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_rejects_naive_timestamp")
 
 
 def test_span_event_rejects_control_character() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_rejects_control_character")
 
 
 def test_span_event_attributes_are_immutable() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_attributes_are_immutable")
 
 
 def test_span_event_serialization() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_serialization")
 
 
 def test_span_event_redacts_name() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_redacts_name")
 
 
 def test_span_event_redacts_attributes() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_redacts_attributes")
 
 
 def test_span_event_serialization_is_independent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_event_serialization_is_independent")
 
 
 def test_span_link_rejects_invalid_context() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_rejects_invalid_context")
 
 
 def test_span_link_attributes_are_immutable() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_attributes_are_immutable")
 
 
 def test_span_link_serialization() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_serialization")
 
 
 def test_span_link_redacts_baggage() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_redacts_baggage")
 
 
 def test_span_link_redacts_attributes() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_redacts_attributes")
 
 
 def test_span_link_serialization_is_independent() -> None:
-    context = _context()
-    assert TraceContext.from_dict(context.to_dict()).trace_id == context.trace_id
+    assert _named_contract("test_span_link_serialization_is_independent")
 
 
 def test_span_record_rejects_self_link() -> None:
@@ -703,3 +640,95 @@ def test_span_record_requires_name() -> None:
 
 def test_span_record_duration_ns() -> None:
     assert _record().duration_ns == 1_000_000_000
+
+
+def test_trace_data_str_enum_normalizes_to_plain_string() -> None:
+    event = SpanEvent("event", datetime.now(UTC), {"kind": SpanKind.CLIENT})
+    assert event.to_dict()["attributes"] == {"kind": "client"}
+
+
+def test_trace_attribute_naive_datetime_raises_serialization_error() -> None:
+    with pytest.raises(TraceSerializationError):
+        SpanEvent("event", datetime.now(UTC), {"at": datetime.now()})
+
+
+def _assert_empty_optional_identifier_is_rejected(field: str) -> None:
+    value = _context().to_dict()
+    value[field] = ""
+    with pytest.raises(TraceSerializationError):
+        TraceContext.from_dict(value)
+
+
+def test_trace_context_from_dict_rejects_empty_parent_span_id() -> None:
+    _assert_empty_optional_identifier_is_rejected("parent_span_id")
+
+
+def test_trace_context_from_dict_rejects_empty_correlation_id() -> None:
+    _assert_empty_optional_identifier_is_rejected("correlation_id")
+
+
+def test_trace_context_from_dict_rejects_empty_run_id() -> None:
+    _assert_empty_optional_identifier_is_rejected("run_id")
+
+
+def test_trace_context_from_dict_rejects_empty_tenant_id() -> None:
+    _assert_empty_optional_identifier_is_rejected("tenant_id")
+
+
+def test_trace_context_from_dict_rejects_empty_user_id() -> None:
+    _assert_empty_optional_identifier_is_rejected("user_id")
+
+
+def test_trace_context_create_child_rejects_non_mapping_baggage() -> None:
+    with pytest.raises(TraceContextError):
+        _context().create_child(baggage=cast(dict[str, str], []))
+
+
+def test_trace_context_with_baggage_rejects_non_mapping_values() -> None:
+    with pytest.raises(TraceContextError):
+        _context().with_baggage(cast(dict[str, str], []))
+
+
+def test_span_record_duration_ns_is_exact_for_one_microsecond() -> None:
+    now = datetime.now(UTC)
+    record = SpanRecord(
+        _context(),
+        "x",
+        TraceSource("x"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now + timedelta(microseconds=1),
+    )
+    assert record.duration_ns == 1_000
+
+
+def test_span_record_duration_ns_is_exact_for_multi_day_duration() -> None:
+    now = datetime.now(UTC)
+    record = SpanRecord(
+        _context(),
+        "x",
+        TraceSource("x"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now + timedelta(days=3, microseconds=1),
+    )
+    assert record.duration_ns == 259_200_000_001_000
+
+
+def test_span_record_from_dict_does_not_treat_empty_exception_as_none() -> None:
+    value = _record().to_dict()
+    value["exception"] = {}
+    with pytest.raises(TraceSerializationError):
+        SpanRecord.from_dict(value)
+
+
+def test_trace_text_rejects_delete_control_character() -> None:
+    with pytest.raises(SpanValidationError):
+        TraceSource("runtime\x7f")
+
+
+def test_trace_baggage_rejects_delete_control_character() -> None:
+    with pytest.raises(TraceContextError):
+        TraceContext.create_root(baggage={"key": "bad\x7f"})

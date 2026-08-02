@@ -13,7 +13,12 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Self, cast
 
-from alios_core.errors import SpanValidationError, TraceContextError, TraceSerializationError
+from alios_core.errors import (
+    LogSerializationError,
+    SpanValidationError,
+    TraceContextError,
+    TraceSerializationError,
+)
 from alios_core.ids import CorrelationId, Identifier, RunId, SpanId, TenantId, TraceId, UserId
 from alios_core.types import JsonValue
 
@@ -42,7 +47,10 @@ def _text(
     if (
         len(result) > maximum
         or "\0" in result
-        or any(ord(char) < 32 and (newlines is False or char not in "\n\r") for char in result)
+        or any(
+            (ord(char) < 32 and (not newlines or char not in "\n\r")) or ord(char) == 127
+            for char in result
+        )
     ):
         raise SpanValidationError(f"Invalid {field_name}")
     return result or None
@@ -53,6 +61,8 @@ def _normal(
 ) -> JsonValue:
     if depth > 16:
         raise TraceSerializationError("Trace data nesting is too deep")
+    if isinstance(value, StrEnum):
+        return value.value
     if value is None or isinstance(value, (str, bool, int)):
         if isinstance(value, str) and len(value) > 16_384:
             raise TraceSerializationError("Trace string is too long")
@@ -61,12 +71,12 @@ def _normal(
         if not math.isfinite(value):
             raise TraceSerializationError("Trace data is not JSON-compatible")
         return value
-    if isinstance(value, StrEnum):
-        return value.value
     if isinstance(value, Identifier):
         return str(value)
     if isinstance(value, datetime):
-        return _aware(value).isoformat()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise TraceSerializationError("Trace attribute datetimes must be timezone-aware")
+        return value.isoformat()
     counter = count if count is not None else [0]
     visited = seen if seen is not None else set()
     if isinstance(value, Mapping):
@@ -139,7 +149,7 @@ def _baggage(value: Mapping[str, str]) -> Mapping[str, str]:
             or key.startswith("__")
             or len(item) > 1024
             or "\0" in item
-            or any(ord(char) < 32 for char in item)
+            or any(ord(char) < 32 or ord(char) == 127 for char in item)
         ):
             raise TraceContextError("Invalid trace baggage")
         result[key] = item
@@ -276,6 +286,8 @@ class TraceContext:
         sampled: bool | None = None,
         baggage: Mapping[str, str] | None = None,
     ) -> Self:
+        if baggage is not None and not isinstance(baggage, Mapping):
+            raise TraceContextError("Invalid trace baggage")
         child = span_id or SpanId()
         if child == self.span_id:
             raise TraceContextError("Child span cannot equal parent span")
@@ -295,6 +307,8 @@ class TraceContext:
         )
 
     def with_baggage(self, values: Mapping[str, str] | None = None, **kwargs: str) -> Self:
+        if values is not None and not isinstance(values, Mapping):
+            raise TraceContextError("Invalid trace baggage")
         if values is not None and set(values).intersection(kwargs):
             raise TraceContextError("Ambiguous trace baggage")
         return cast(
@@ -340,7 +354,7 @@ class TraceContext:
 
             def optional(name: str, kind: type[Identifier]) -> Identifier | None:
                 item = value.get(name)
-                if item is not None and not isinstance(item, str):
+                if item is not None and (not isinstance(item, str) or not item.strip()):
                     raise ValueError
                 return kind(item) if item else None
 
@@ -539,7 +553,10 @@ class SpanRecord:
 
     @property
     def duration_ns(self) -> int:
-        return int(self.duration.total_seconds() * 1_000_000_000)
+        duration = self.duration
+        return (
+            duration.days * 86_400 + duration.seconds
+        ) * 1_000_000_000 + duration.microseconds * 1_000
 
     def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
         policy = redaction_policy or default_redaction_policy()
@@ -606,11 +623,17 @@ class SpanRecord:
                 tuple(SpanEvent.from_dict(item) for item in events),
                 tuple(SpanLink.from_dict(item) for item in links),
                 LogException.from_dict(cast(Mapping[str, object], raw_exception))
-                if raw_exception
+                if raw_exception is not None
                 else None,
             )
             if result.duration_ns != value["duration_ns"]:
                 raise ValueError
             return result
-        except (TypeError, ValueError, SpanValidationError, TraceSerializationError) as error:
+        except (
+            TypeError,
+            ValueError,
+            LogSerializationError,
+            SpanValidationError,
+            TraceSerializationError,
+        ) as error:
             raise TraceSerializationError("Invalid span record") from error
