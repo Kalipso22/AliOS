@@ -91,3 +91,7 @@ class ScheduleId(Identifier):
 
 class CheckpointId(Identifier):
     pass
+
+
+class LogRecordId(Identifier):
+    pass

@@ -110,3 +110,19 @@ class ExternalServiceError(AliOSError):
 
 class SerializationError(AliOSError):
     code = "serialization_error"
+
+
+class ObservabilityError(AliOSError):
+    code = "observability_error"
+
+
+class LoggingError(ObservabilityError):
+    code = "logging_error"
+
+
+class LogSerializationError(LoggingError):
+    code = "log_serialization_error"
+
+
+class LogSinkError(LoggingError):
+    code = "log_sink_error"
