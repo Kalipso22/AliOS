@@ -105,6 +105,21 @@ class RecoveryCompleted(BaseEvent):
     failure_code: str | None = None
     checkpoint_id: str | None = None
 
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return the safe, transport-ready recovery completion event payload."""
+        data = BaseEvent.to_dict(self)
+        data.update(
+            {
+                "run_id": self.run_id,
+                "recovery_id": self.recovery_id,
+                "mode": self.mode,
+                "success": self.success,
+                "failure_code": self.failure_code,
+                "checkpoint_id": self.checkpoint_id,
+            }
+        )
+        return data
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyEvaluated(BaseEvent):
