@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from itertools import product
@@ -6,15 +7,34 @@ from uuid import UUID, uuid4
 
 import pytest
 from alios_core import CorrelationId, RunId, SpanId, TraceId
-from alios_core.errors import SpanValidationError, TraceContextError, TraceSerializationError
+from alios_core.errors import (
+    SamplingError,
+    SpanCompletionError,
+    SpanLimitError,
+    SpanStateError,
+    SpanValidationError,
+    TraceContextError,
+    TraceSerializationError,
+)
 from alios_core.ids import TenantId, UserId
 from alios_observability import (
+    AlwaysOffSampler,
+    AlwaysOnSampler,
+    AlwaysRecordSampler,
+    DefaultTracer,
+    ParentBasedSampler,
+    RedactionPolicy,
+    SamplingDecision,
+    SamplingRequest,
+    SamplingResult,
     SpanEvent,
     SpanKind,
+    SpanLimits,
     SpanLink,
     SpanRecord,
     SpanStatus,
     TraceContext,
+    TraceIdRatioSampler,
     TraceSource,
     bind_trace_context,
     current_trace_context,
@@ -880,6 +900,726 @@ def test_trace_context_create_child_rejects_non_mapping_baggage() -> None:
 def test_trace_context_with_baggage_rejects_non_mapping_values() -> None:
     with pytest.raises(TraceContextError):
         _context().with_baggage(cast(dict[str, str], []))
+
+
+# Active tracing contracts -------------------------------------------------
+
+
+def test_sampling_decision_exact_values() -> None:
+    assert tuple(item.value for item in SamplingDecision) == (
+        "drop",
+        "record_only",
+        "record_and_sample",
+    )
+
+
+def test_sampling_decision_parsing() -> None:
+    assert SamplingDecision.parse("record_only") is SamplingDecision.RECORD_ONLY
+
+
+def test_sampling_decision_rejects_unknown_value() -> None:
+    with pytest.raises(SamplingError):
+        SamplingDecision.parse("sometimes")
+
+
+def test_sampling_result_drop_flags() -> None:
+    result = SamplingResult(SamplingDecision.DROP)
+    assert not result.is_recording and not result.is_sampled
+
+
+def test_sampling_result_record_only_flags() -> None:
+    result = SamplingResult(SamplingDecision.RECORD_ONLY)
+    assert result.is_recording and not result.is_sampled
+
+
+def test_sampling_result_record_and_sample_flags() -> None:
+    result = SamplingResult(SamplingDecision.RECORD_AND_SAMPLE)
+    assert result.is_recording and result.is_sampled
+
+
+def test_sampling_result_attributes_are_immutable() -> None:
+    values = {"nested": {"value": 1}}
+    result = SamplingResult(SamplingDecision.DROP, values)
+    values["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        cast(dict[str, object], result.attributes)["other"] = 1
+    assert result.to_dict(RedactionPolicy(include_default_rules=False))["attributes"] == {
+        "nested": {"value": 1}
+    }
+
+
+def test_sampling_result_serialization() -> None:
+    assert SamplingResult(SamplingDecision.RECORD_ONLY, {"value": 1}).to_dict(
+        RedactionPolicy(include_default_rules=False)
+    ) == {"decision": "record_only", "attributes": {"value": 1}}
+
+
+def test_sampling_result_round_trip() -> None:
+    result = SamplingResult(SamplingDecision.RECORD_AND_SAMPLE, {"value": 1})
+    assert (
+        SamplingResult.from_dict(result.to_dict(RedactionPolicy(include_default_rules=False)))
+        == result
+    )
+
+
+def test_sampling_result_from_dict_uses_strict_types() -> None:
+    with pytest.raises(TraceSerializationError):
+        SamplingResult.from_dict({"decision": 1, "attributes": {}})
+
+
+def test_sampling_request_valid() -> None:
+    parent = _context()
+    request = SamplingRequest(TraceId(), parent, "work", TraceSource("test"), SpanKind.CLIENT)
+    assert request.parent_context == parent and request.name == "work"
+
+
+def test_sampling_request_rejects_wrong_trace_id() -> None:
+    with pytest.raises(SamplingError):
+        SamplingRequest(
+            cast(TraceId, SpanId()), None, "work", TraceSource("test"), SpanKind.INTERNAL
+        )
+
+
+def test_sampling_request_rejects_wrong_parent() -> None:
+    with pytest.raises(SamplingError):
+        SamplingRequest(
+            TraceId(), cast(TraceContext, "parent"), "work", TraceSource("test"), SpanKind.INTERNAL
+        )
+
+
+def test_sampling_request_rejects_wrong_source() -> None:
+    with pytest.raises(SamplingError):
+        SamplingRequest(TraceId(), None, "work", cast(TraceSource, "source"), SpanKind.INTERNAL)
+
+
+def test_sampling_request_rejects_wrong_kind() -> None:
+    with pytest.raises(SamplingError):
+        SamplingRequest(TraceId(), None, "work", TraceSource("test"), cast(SpanKind, "kind"))
+
+
+def test_sampling_request_attributes_are_immutable() -> None:
+    values = {"nested": [1]}
+    request = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL, values
+    )
+    values["nested"].append(2)
+    assert request.to_dict(RedactionPolicy(include_default_rules=False))["attributes"] == {
+        "nested": [1]
+    }
+
+
+def test_sampling_request_links_are_immutable() -> None:
+    links = (SpanLink(_context()),)
+    request = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL, links=links
+    )
+    assert request.links == links and request.links is links
+
+
+def test_sampling_request_rejects_duplicate_links() -> None:
+    link = SpanLink(_context())
+    with pytest.raises(SpanValidationError):
+        SamplingRequest(
+            TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL, links=(link, link)
+        )
+
+
+def test_sampling_request_serialization() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert request.to_dict(RedactionPolicy(include_default_rules=False))["name"] == "work"
+
+
+def test_sampling_request_round_trip() -> None:
+    request = SamplingRequest(TraceId(), _context(), "work", TraceSource("test"), SpanKind.INTERNAL)
+    policy = RedactionPolicy(include_default_rules=False)
+    assert SamplingRequest.from_dict(request.to_dict(policy)) == request
+
+
+def test_sampling_request_rendering_redacts_attributes() -> None:
+    secret = "ACTIVE-SECRET"
+    request = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL, {"api_key": secret}
+    )
+    assert secret not in str(request.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_always_on_sampler_records_and_samples() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (
+        await AlwaysOnSampler().should_sample(request)
+    ).decision is SamplingDecision.RECORD_AND_SAMPLE
+
+
+@pytest.mark.asyncio
+async def test_always_off_sampler_drops() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (await AlwaysOffSampler().should_sample(request)).decision is SamplingDecision.DROP
+
+
+@pytest.mark.asyncio
+async def test_always_record_sampler_records_only() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (
+        await AlwaysRecordSampler().should_sample(request)
+    ).decision is SamplingDecision.RECORD_ONLY
+
+
+@pytest.mark.asyncio
+async def test_sampler_rejects_wrong_request_type() -> None:
+    with pytest.raises(SamplingError):
+        await AlwaysOnSampler().should_sample(cast(SamplingRequest, "request"))
+
+
+def test_ratio_sampler_rejects_boolean_ratio() -> None:
+    with pytest.raises(SamplingError):
+        TraceIdRatioSampler(True)
+
+
+def test_ratio_sampler_rejects_nan_ratio() -> None:
+    with pytest.raises(SamplingError):
+        TraceIdRatioSampler(float("nan"))
+
+
+def test_ratio_sampler_rejects_negative_ratio() -> None:
+    with pytest.raises(SamplingError):
+        TraceIdRatioSampler(-0.1)
+
+
+def test_ratio_sampler_rejects_ratio_above_one() -> None:
+    with pytest.raises(SamplingError):
+        TraceIdRatioSampler(1.1)
+
+
+@pytest.mark.asyncio
+async def test_ratio_sampler_zero_always_drops() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (await TraceIdRatioSampler(0).should_sample(request)).decision is SamplingDecision.DROP
+
+
+@pytest.mark.asyncio
+async def test_ratio_sampler_one_always_samples() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (
+        await TraceIdRatioSampler(1).should_sample(request)
+    ).decision is SamplingDecision.RECORD_AND_SAMPLE
+
+
+@pytest.mark.asyncio
+async def test_ratio_sampler_is_deterministic() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    sampler = TraceIdRatioSampler(0.5)
+    assert await sampler.should_sample(request) == await sampler.should_sample(request)
+
+
+def test_ratio_sampler_serialization() -> None:
+    assert TraceIdRatioSampler(0.25).to_dict() == {"ratio": 0.25}
+
+
+def test_ratio_sampler_round_trip() -> None:
+    sampler = TraceIdRatioSampler(0.25)
+    assert TraceIdRatioSampler.from_dict(sampler.to_dict()) == sampler
+
+
+@pytest.mark.asyncio
+async def test_parent_sampler_delegates_root() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    assert (
+        await ParentBasedSampler(AlwaysRecordSampler()).should_sample(request)
+    ).decision is SamplingDecision.RECORD_ONLY
+
+
+@pytest.mark.asyncio
+async def test_parent_sampler_samples_sampled_parent() -> None:
+    request = SamplingRequest(
+        TraceId(),
+        TraceContext.create_root(sampled=True),
+        "work",
+        TraceSource("test"),
+        SpanKind.INTERNAL,
+    )
+    assert (await ParentBasedSampler(AlwaysOffSampler()).should_sample(request)).is_sampled
+
+
+@pytest.mark.asyncio
+async def test_parent_sampler_drops_unsampled_parent() -> None:
+    request = SamplingRequest(
+        TraceId(),
+        TraceContext.create_root(sampled=False),
+        "work",
+        TraceSource("test"),
+        SpanKind.INTERNAL,
+    )
+    assert not (await ParentBasedSampler(AlwaysOnSampler()).should_sample(request)).is_recording
+
+
+def test_span_limits_defaults() -> None:
+    assert SpanLimits() == SpanLimits(128, 128, 128)
+
+
+def test_span_limits_rejects_zero_attribute_limit() -> None:
+    with pytest.raises(SpanLimitError):
+        SpanLimits(maximum_attributes=0)
+
+
+def test_span_limits_rejects_boolean_limit() -> None:
+    with pytest.raises(SpanLimitError):
+        SpanLimits(maximum_events=True)
+
+
+def test_span_limits_rejects_excessive_limit() -> None:
+    with pytest.raises(SpanLimitError):
+        SpanLimits(maximum_links=100_001)
+
+
+def test_span_limits_serialization() -> None:
+    assert SpanLimits(1, 2, 3).to_dict()["maximum_events"] == 2
+
+
+def test_span_limits_round_trip() -> None:
+    limits = SpanLimits(1, 2, 3)
+    assert SpanLimits.from_dict(limits.to_dict()) == limits
+
+
+@pytest.mark.asyncio
+async def test_recording_span_initial_state() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    assert span.is_recording and not span.is_ended and span.context.sampled
+
+
+@pytest.mark.asyncio
+async def test_recording_span_set_attribute() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.set_attribute("Region", "eu")
+    assert cast(SpanRecord, await span.end()).attributes == {"Region": "eu"}
+
+
+@pytest.mark.asyncio
+async def test_recording_span_replace_attribute_at_limit() -> None:
+    span = await DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1)).start_span(
+        "work", attributes={"region": "eu"}
+    )
+    await span.set_attribute("region", "us")
+    assert cast(SpanRecord, await span.end()).attributes == {"region": "us"}
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_new_attribute_over_limit() -> None:
+    span = await DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1)).start_span("work")
+    await span.set_attribute("first", 1)
+    with pytest.raises(SpanLimitError):
+        await span.set_attribute("second", 2)
+    assert cast(SpanRecord, await span.end()).attributes == {"first": 1}
+
+
+@pytest.mark.asyncio
+async def test_recording_span_set_attributes_is_atomic() -> None:
+    span = await DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1)).start_span("work")
+    with pytest.raises(SpanLimitError):
+        await span.set_attributes({"first": 1, "second": 2})
+    assert cast(SpanRecord, await span.end()).attributes == {}
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_invalid_attribute_name() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.set_attribute("bad\nname", 1)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_attribute_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.set_attribute("value", 1)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_attribute_input_isolation() -> None:
+    value = {"nested": [1]}
+    span = await DefaultTracer(TraceSource("test")).start_span("work", attributes=value)
+    value["nested"].append(2)
+    assert cast(SpanRecord, await span.end()).attributes == {"nested": (1,)}
+
+
+@pytest.mark.asyncio
+async def test_recording_span_add_event() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    event = await span.add_event("started", attributes={"phase": 1})
+    assert event is not None and cast(SpanRecord, await span.end()).events == (event,)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_event_uses_clock() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: now).start_span("work")
+    assert cast(SpanEvent, await span.add_event("started")).timestamp == now
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_event_before_start() -> None:
+    start = datetime(2026, 1, 2, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: start).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.add_event("early", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_out_of_order_event() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: start).start_span("work")
+    await span.add_event("later", timestamp=start + timedelta(seconds=2))
+    with pytest.raises(SpanValidationError):
+        await span.add_event("earlier", timestamp=start + timedelta(seconds=1))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_allows_equal_event_timestamp() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: now).start_span("work")
+    first = await span.add_event("first", timestamp=now)
+    second = await span.add_event("second", timestamp=now)
+    assert cast(SpanRecord, await span.end()).events == (first, second)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_event_limit() -> None:
+    span = await DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1)).start_span("work")
+    await span.add_event("first")
+    with pytest.raises(SpanLimitError):
+        await span.add_event("second")
+
+
+@pytest.mark.asyncio
+async def test_recording_span_add_link() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    link = SpanLink(TraceContext.create_root())
+    assert await span.add_link(link) and cast(SpanRecord, await span.end()).links == (link,)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_self_link() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.add_link(SpanLink(span.context))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_duplicate_link() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    link = SpanLink(TraceContext.create_root())
+    await span.add_link(link)
+    with pytest.raises(SpanValidationError):
+        await span.add_link(link)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_link_limit() -> None:
+    span = await DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1)).start_span("work")
+    await span.add_link(SpanLink(TraceContext.create_root()))
+    with pytest.raises(SpanLimitError):
+        await span.add_link(SpanLink(TraceContext.create_root()))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_event_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.add_event("late")
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_link_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.add_link(SpanLink(TraceContext.create_root()))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_set_status() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.set_status(SpanStatus.TIMEOUT, "slow")
+    assert cast(SpanRecord, await span.end()).status is SpanStatus.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_wrong_status() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.set_status(cast(SpanStatus, "ok"))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_status_message_validation() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.set_status(SpanStatus.ERROR, "bad\x01")
+
+
+@pytest.mark.asyncio
+async def test_recording_span_records_alios_error() -> None:
+    from alios_core.errors import ValidationError
+
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    exception = await span.record_exception(ValidationError("invalid", {"field": "name"}))
+    assert exception is not None and cast(SpanRecord, await span.end()).exception == exception
+
+
+@pytest.mark.asyncio
+async def test_recording_span_records_ordinary_exception_safely() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    exception = await span.record_exception(ValueError("ACTIVE-SECRET"))
+    assert exception is not None and "ACTIVE-SECRET" not in str(exception)
+
+
+@pytest.mark.asyncio
+async def test_recording_span_exception_sets_error_status() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.record_exception(ValueError("invalid"))
+    assert cast(SpanRecord, await span.end()).status is SpanStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_second_exception() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.record_exception(ValueError("one"))
+    with pytest.raises(SpanStateError):
+        await span.record_exception(ValueError("two"))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_cancelled_error_propagates() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(asyncio.CancelledError):
+        await span.record_exception(asyncio.CancelledError())
+
+
+@pytest.mark.asyncio
+async def test_recording_span_keyboard_interrupt_propagates() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(KeyboardInterrupt):
+        await span.record_exception(KeyboardInterrupt())
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_exception_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.record_exception(ValueError("late"))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_end_creates_record() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    record = await span.end()
+    assert isinstance(record, SpanRecord) and record.status is SpanStatus.UNSET
+
+
+@pytest.mark.asyncio
+async def test_recording_span_end_uses_clock() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: now).start_span("work")
+    assert cast(SpanRecord, await span.end()).ended_at == now
+
+
+@pytest.mark.asyncio
+async def test_recording_span_rejects_end_before_start() -> None:
+    now = datetime(2026, 1, 2, tzinfo=UTC)
+    span = await DefaultTracer(TraceSource("test"), clock=lambda: now).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.end(ended_at=datetime(2026, 1, 1, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_recording_span_repeated_end_returns_same_record() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    assert await span.end() is await span.end()
+
+
+@pytest.mark.asyncio
+async def test_recording_span_concurrent_end_calls_handler_once() -> None:
+    class Handler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def on_end(self, record: SpanRecord) -> None:
+            self.calls += 1
+
+    handler = Handler()
+    span = await DefaultTracer(TraceSource("test"), end_handler=handler).start_span("work")
+    first, second = await asyncio.gather(span.end(), span.end())
+    assert first is second and handler.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recording_span_handler_failure_marks_span_ended() -> None:
+    class FailingHandler:
+        async def on_end(self, record: SpanRecord) -> None:
+            raise RuntimeError("handler failure")
+
+    span = await DefaultTracer(TraceSource("test"), end_handler=FailingHandler()).start_span("work")
+    with pytest.raises(SpanCompletionError):
+        await span.end()
+    assert span.is_ended
+
+
+@pytest.mark.asyncio
+async def test_recording_span_handler_failure_is_not_retried() -> None:
+    class FailingHandler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def on_end(self, record: SpanRecord) -> None:
+            self.calls += 1
+            raise RuntimeError("handler failure")
+
+    handler = FailingHandler()
+    span = await DefaultTracer(TraceSource("test"), end_handler=handler).start_span("work")
+    with pytest.raises(SpanCompletionError):
+        await span.end()
+    assert await span.end() is not None and handler.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recording_span_mutation_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.set_status(SpanStatus.OK)
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_context() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert not span.is_recording and not span.context.sampled
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_does_not_store_attributes() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    await span.set_attribute("region", "eu")
+    assert await span.end() is None
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_add_event_returns_none() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert await span.add_event("event") is None
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_add_link_returns_false() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert not await span.add_link(SpanLink(TraceContext.create_root()))
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_does_not_inspect_ordinary_exception() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert await span.record_exception(ValueError("DROP-SECRET")) is None
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_process_control_exception_propagates() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    with pytest.raises(asyncio.CancelledError):
+        await span.record_exception(asyncio.CancelledError())
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_end_returns_none() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert await span.end() is None
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_repeated_end() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    assert await span.end() is None and await span.end() is None
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_mutation_after_end() -> None:
+    span = await DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler()).start_span("work")
+    await span.end()
+    with pytest.raises(SpanStateError):
+        await span.set_attribute("late", 1)
+
+
+@pytest.mark.asyncio
+async def test_default_tracer_configuration() -> None:
+    tracer = DefaultTracer(TraceSource("test"))
+    assert tracer.source == TraceSource("test") and not (await tracer.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_tracer_starts_root_span() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("root", root=True)
+    assert span.parent_context is None
+
+
+@pytest.mark.asyncio
+async def test_tracer_uses_bound_parent() -> None:
+    parent = _context()
+    with bind_trace_context(parent):
+        span = await DefaultTracer(TraceSource("test")).start_span("child")
+    assert span.parent_context == parent and span.context.parent_span_id == parent.span_id
+
+
+@pytest.mark.asyncio
+async def test_tracer_explicit_parent_overrides_bound_context() -> None:
+    bound, explicit = _context(), _context()
+    with bind_trace_context(bound):
+        span = await DefaultTracer(TraceSource("test")).start_span("child", parent=explicit)
+    assert span.parent_context == explicit
+
+
+@pytest.mark.asyncio
+async def test_tracer_root_ignores_bound_context() -> None:
+    with bind_trace_context(_context()):
+        span = await DefaultTracer(TraceSource("test")).start_span("root", root=True)
+    assert span.parent_context is None
+
+
+@pytest.mark.asyncio
+async def test_tracer_rejects_root_with_parent() -> None:
+    with pytest.raises(TraceContextError):
+        await DefaultTracer(TraceSource("test")).start_span("root", root=True, parent=_context())
+
+
+@pytest.mark.asyncio
+async def test_tracer_child_uses_parent_trace_id() -> None:
+    parent = _context()
+    span = await DefaultTracer(TraceSource("test")).start_span("child", parent=parent)
+    assert span.context.trace_id == parent.trace_id
+
+
+@pytest.mark.asyncio
+async def test_tracer_explicit_root_trace_id() -> None:
+    identifier = TraceId()
+    span = await DefaultTracer(TraceSource("test")).start_span("root", trace_id=identifier)
+    assert span.context.trace_id == identifier
+
+
+@pytest.mark.asyncio
+async def test_tracer_rejects_child_trace_id() -> None:
+    with pytest.raises(TraceContextError):
+        await DefaultTracer(TraceSource("test")).start_span(
+            "child", parent=_context(), trace_id=TraceId()
+        )
+
+
+@pytest.mark.asyncio
+async def test_tracer_rejects_span_id_equal_to_parent() -> None:
+    parent = _context()
+    with pytest.raises(TraceContextError):
+        await DefaultTracer(TraceSource("test")).start_span(
+            "child", parent=parent, span_id=parent.span_id
+        )
 
 
 def test_span_record_duration_ns_is_exact_for_one_microsecond() -> None:

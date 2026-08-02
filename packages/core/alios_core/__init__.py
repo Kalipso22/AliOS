@@ -11,6 +11,13 @@ from .config import (
     SourceMetadata,
 )
 from .container import Container, ServiceKey, ServiceLifetime
+from .errors import (
+    SamplingError,
+    SpanCompletionError,
+    SpanLimitError,
+    SpanStateError,
+    TracerClosedError,
+)
 from .events import AsyncEventBus, BaseEvent, DispatchMode, Event, EventBus, PolicyEvaluated
 from .ids import CorrelationId, LogRecordId, RunId, SpanId, TraceId
 from .lifecycle import LifecycleHealth, LifecycleManager, LifecycleState, ManagedLifecycleComponent
@@ -55,6 +62,7 @@ __all__ = [
     "PolicySubject",
     "RunId",
     "RunStatus",
+    "SamplingError",
     "SecretReference",
     "SensitiveValue",
     "ServiceKey",
@@ -62,5 +70,9 @@ __all__ = [
     "SettingsSnapshot",
     "SourceMetadata",
     "SpanId",
+    "SpanCompletionError",
+    "SpanLimitError",
+    "SpanStateError",
     "TraceId",
+    "TracerClosedError",
 ]

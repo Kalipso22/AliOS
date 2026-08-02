@@ -144,6 +144,26 @@ class SpanValidationError(TracingError):
     code = "span_validation_error"
 
 
+class SamplingError(TracingError):
+    code = "sampling_error"
+
+
+class SpanStateError(TracingError):
+    code = "span_state_error"
+
+
+class SpanLimitError(TracingError):
+    code = "span_limit_error"
+
+
+class TracerClosedError(TracingError):
+    code = "tracer_closed"
+
+
+class SpanCompletionError(TracingError):
+    code = "span_completion_error"
+
+
 class MetricsError(ObservabilityError):
     code = "metrics_error"
 
