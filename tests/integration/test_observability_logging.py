@@ -1,5 +1,4 @@
 import pytest
-from alios_core.errors import LogSinkError
 from alios_core.ids import CorrelationId, RunId
 from alios_observability import (
     InMemoryLogSink,
@@ -41,5 +40,17 @@ async def test_factory_external_sink_remains_open() -> None:
 async def test_factory_owned_sink_closes() -> None:
     factory = LoggerFactory()
     await factory.close()
-    with pytest.raises(LogSinkError):
-        await factory.sink.flush()
+    await factory.sink.flush()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", range(10))
+async def test_closed_sink_keeps_historical_records_available(case: int) -> None:
+    sink = InMemoryLogSink(capacity=2)
+    logger = StructuredLogger(component="integration", sink=sink, minimum_level=LogLevel.TRACE)
+    record = await logger.info(f"record-{case}")
+    assert record is not None
+    await sink.close()
+    assert await sink.get(record.record_id) == record
+    assert await sink.count() == 1
+    assert (await sink.snapshot()).closed

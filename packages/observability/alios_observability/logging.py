@@ -15,7 +15,14 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol, Self
 
-from alios_core.errors import AliOSError, LogSerializationError, LogSinkError, ValidationError
+from alios_core.errors import (
+    AliOSError,
+    LogSerializationError,
+    LogSinkError,
+    ResourceConflictError,
+    ResourceNotFoundError,
+    ValidationError,
+)
 from alios_core.ids import (
     AgentId,
     CorrelationId,
@@ -104,6 +111,25 @@ def _attributes(value: Mapping[str, object] | None) -> Mapping[str, object]:
     if not isinstance(normalized, dict):
         raise LogSerializationError("Logging attributes must be a mapping")
     return MappingProxyType({key: _freeze(item) for key, item in normalized.items()})
+
+
+def _filter_texts(values: frozenset[str] | None, field_name: str) -> frozenset[str] | None:
+    if values is None:
+        return None
+    normalized_values: set[str] = set()
+    for value in values:
+        normalized_value = _validate_text(value, field_name, required=True)
+        if normalized_value is None:
+            raise ValidationError(f"{field_name} is required")
+        normalized_values.add(normalized_value)
+    normalized = frozenset(normalized_values)
+    return normalized or None
+
+
+def _integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("Expected an integer")
+    return int(value)
 
 
 class LogLevel(StrEnum):
@@ -523,14 +549,70 @@ class LogFilter:
     maximum_level: LogLevel | None = None
     levels: frozenset[LogLevel] | None = None
     components: frozenset[str] | None = None
+    modules: frozenset[str] | None = None
+    operations: frozenset[str] | None = None
     correlation_id: CorrelationId | None = None
     run_id: RunId | None = None
+    tenant_id: TenantId | None = None
+    user_id: UserId | None = None
+    record_ids: frozenset[LogRecordId] | None = None
+    created_after: datetime | None = None
+    created_before: datetime | None = None
+    message_contains: str | None = None
+    attribute_equals: Mapping[str, object] = field(default_factory=dict)
     limit: int | None = None
     offset: int = 0
 
     def __post_init__(self) -> None:
         if (self.limit is not None and self.limit < 0) or self.offset < 0:
             raise ValidationError("Invalid log filter")
+        if any(
+            level is not None and not isinstance(level, LogLevel)
+            for level in (self.minimum_level, self.maximum_level)
+        ):
+            raise ValidationError("Invalid log level")
+        if (
+            self.minimum_level
+            and self.maximum_level
+            and self.minimum_level.severity > self.maximum_level.severity
+        ):
+            raise ValidationError("Invalid log level range")
+        identifier_types: tuple[tuple[object | None, type[object]], ...] = (
+            (self.correlation_id, CorrelationId),
+            (self.run_id, RunId),
+            (self.tenant_id, TenantId),
+            (self.user_id, UserId),
+        )
+        if any(
+            item is not None and not isinstance(item, expected)
+            for item, expected in identifier_types
+        ):
+            raise ValidationError("Invalid log filter identifier")
+        for value in (self.created_after, self.created_before):
+            if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+                raise ValidationError("Log filter times must be timezone-aware")
+        if self.created_after and self.created_before and self.created_after >= self.created_before:
+            raise ValidationError("Invalid log time range")
+        if self.message_contains is not None:
+            object.__setattr__(
+                self,
+                "message_contains",
+                _validate_text(self.message_contains, "message query", required=True),
+            )
+        object.__setattr__(self, "components", _filter_texts(self.components, "component"))
+        object.__setattr__(self, "modules", _filter_texts(self.modules, "module"))
+        object.__setattr__(self, "operations", _filter_texts(self.operations, "operation"))
+        levels = frozenset(self.levels or ()) or None
+        if levels is not None and not all(isinstance(level, LogLevel) for level in levels):
+            raise ValidationError("Invalid log levels")
+        record_ids = frozenset(self.record_ids or ()) or None
+        if record_ids is not None and not all(
+            isinstance(record_id, LogRecordId) for record_id in record_ids
+        ):
+            raise ValidationError("Invalid log record identifiers")
+        object.__setattr__(self, "levels", levels)
+        object.__setattr__(self, "record_ids", record_ids)
+        object.__setattr__(self, "attribute_equals", _attributes(self.attribute_equals))
 
     def matches(self, record: LogRecord) -> bool:
         return (
@@ -538,11 +620,113 @@ class LogFilter:
             and (self.maximum_level is None or record.level.severity <= self.maximum_level.severity)
             and (self.levels is None or record.level in self.levels)
             and (self.components is None or record.source.component in self.components)
+            and (self.modules is None or record.source.module in self.modules)
+            and (self.operations is None or record.source.operation in self.operations)
             and (
                 self.correlation_id is None or record.context.correlation_id == self.correlation_id
             )
             and (self.run_id is None or record.context.run_id == self.run_id)
+            and (self.tenant_id is None or record.context.tenant_id == self.tenant_id)
+            and (self.user_id is None or record.context.user_id == self.user_id)
+            and (self.record_ids is None or record.record_id in self.record_ids)
+            and (self.created_after is None or record.timestamp > self.created_after)
+            and (self.created_before is None or record.timestamp < self.created_before)
+            and (self.message_contains is None or self.message_contains in record.message)
+            and all(
+                ({**dict(record.context.attributes), **dict(record.attributes)}).get(key) == value
+                for key, value in self.attribute_equals.items()
+            )
         )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "minimum_level": self.minimum_level.value if self.minimum_level else None,
+            "maximum_level": self.maximum_level.value if self.maximum_level else None,
+            "levels": sorted(level.value for level in self.levels) if self.levels else None,
+            "components": sorted(self.components) if self.components else None,
+            "modules": sorted(self.modules) if self.modules else None,
+            "operations": sorted(self.operations) if self.operations else None,
+            "correlation_id": str(self.correlation_id) if self.correlation_id else None,
+            "run_id": str(self.run_id) if self.run_id else None,
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+            "user_id": str(self.user_id) if self.user_id else None,
+            "record_ids": sorted(str(record_id) for record_id in self.record_ids)
+            if self.record_ids
+            else None,
+            "created_after": self.created_after.isoformat() if self.created_after else None,
+            "created_before": self.created_before.isoformat() if self.created_before else None,
+            "message_contains": self.message_contains,
+            "attribute_equals": _thaw(self.attribute_equals),
+            "limit": self.limit,
+            "offset": self.offset,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        def text_set(name: str) -> frozenset[str] | None:
+            raw = value.get(name)
+            if raw is None:
+                return None
+            if not isinstance(raw, Sequence) or isinstance(raw, str):
+                raise LogSerializationError("Invalid log filter")
+            return frozenset(str(item) for item in raw)
+
+        def parsed_time(name: str) -> datetime | None:
+            raw = value.get(name)
+            if raw is None:
+                return None
+            if not isinstance(raw, str):
+                raise LogSerializationError("Invalid log filter")
+            return datetime.fromisoformat(raw)
+
+        raw_levels = value.get("levels")
+        raw_record_ids = value.get("record_ids")
+        attributes = value.get("attribute_equals", {})
+        message_contains = value.get("message_contains")
+        try:
+            if raw_levels is not None and (
+                not isinstance(raw_levels, Sequence) or isinstance(raw_levels, str)
+            ):
+                raise ValueError("Invalid log levels")
+            if raw_record_ids is not None and (
+                not isinstance(raw_record_ids, Sequence) or isinstance(raw_record_ids, str)
+            ):
+                raise ValueError("Invalid log record identifiers")
+            if not isinstance(attributes, Mapping) or (
+                message_contains is not None and not isinstance(message_contains, str)
+            ):
+                raise ValueError("Invalid log filter values")
+            return cls(
+                LogLevel.parse(str(value["minimum_level"]))
+                if value.get("minimum_level") is not None
+                else None,
+                LogLevel.parse(str(value["maximum_level"]))
+                if value.get("maximum_level") is not None
+                else None,
+                frozenset(LogLevel.parse(str(item)) for item in raw_levels)
+                if isinstance(raw_levels, Sequence) and not isinstance(raw_levels, str)
+                else None,
+                text_set("components"),
+                text_set("modules"),
+                text_set("operations"),
+                CorrelationId(str(value["correlation_id"]))
+                if value.get("correlation_id")
+                else None,
+                RunId(str(value["run_id"])) if value.get("run_id") else None,
+                TenantId(str(value["tenant_id"])) if value.get("tenant_id") else None,
+                UserId(str(value["user_id"])) if value.get("user_id") else None,
+                frozenset(LogRecordId(str(item)) for item in raw_record_ids)
+                if isinstance(raw_record_ids, Sequence) and not isinstance(raw_record_ids, str)
+                else None,
+                parsed_time("created_after"),
+                parsed_time("created_before"),
+                message_contains,
+                attributes,
+                _integer(value["limit"]) if value.get("limit") is not None else None,
+                _integer(value.get("offset", 0)),
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise LogSerializationError("Invalid log filter") from error
 
 
 class LogSink(Protocol):
@@ -561,6 +745,49 @@ class LogSinkSnapshot:
     failed_count: int
     closed: bool
     created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if (
+            self.capacity < 1
+            or self.stored_count < 0
+            or self.stored_count > self.capacity
+            or self.accepted_count < 0
+            or self.dropped_count < 0
+            or self.failed_count < 0
+        ):
+            raise ValidationError("Invalid log sink snapshot")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValidationError("Log sink snapshot time must be timezone-aware")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "stored_count": self.stored_count,
+            "capacity": self.capacity,
+            "accepted_count": self.accepted_count,
+            "dropped_count": self.dropped_count,
+            "failed_count": self.failed_count,
+            "closed": self.closed,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        created_at = value.get("created_at")
+        closed = value.get("closed")
+        try:
+            if not isinstance(created_at, str) or not isinstance(closed, bool):
+                raise ValueError("invalid snapshot")
+            return cls(
+                _integer(value["stored_count"]),
+                _integer(value["capacity"]),
+                _integer(value["accepted_count"]),
+                _integer(value["dropped_count"]),
+                _integer(value["failed_count"]),
+                closed,
+                datetime.fromisoformat(created_at),
+            )
+        except (KeyError, TypeError, ValueError, ValidationError) as error:
+            raise LogSerializationError("Invalid log sink snapshot") from error
 
 
 class InMemoryLogSink:
@@ -589,21 +816,37 @@ class InMemoryLogSink:
         async with self._lock:
             if self._closed:
                 raise LogSinkError("Log sink is closed")
-            for record in records:
-                if any(item.record_id == record.record_id for item in self._records):
-                    self._failed += 1
-                    raise LogSinkError("Duplicate log record identity")
-                if len(self._records) >= self.capacity:
-                    if self.drop_policy is LogDropPolicy.DROP_NEWEST:
-                        self._dropped += 1
-                        continue
-                    if self.drop_policy is LogDropPolicy.RAISE:
-                        self._failed += 1
-                        raise LogSinkError("Log sink capacity exceeded")
-                    self._records.pop(0)
-                    self._dropped += 1
-                self._records.append(record)
-                self._accepted += 1
+            incoming = tuple(records)
+            if not all(isinstance(record, LogRecord) for record in incoming):
+                self._failed += 1
+                raise LogSinkError("Invalid log record batch")
+            identifiers = [record.record_id for record in incoming]
+            if len(set(identifiers)) != len(identifiers) or any(
+                record_id in {item.record_id for item in self._records} for record_id in identifiers
+            ):
+                self._failed += 1
+                raise ResourceConflictError("Duplicate log record identity")
+            if (
+                self.drop_policy is LogDropPolicy.RAISE
+                and len(self._records) + len(incoming) > self.capacity
+            ):
+                self._failed += 1
+                raise LogSinkError("Log sink capacity exceeded")
+            if self.drop_policy is LogDropPolicy.DROP_OLDEST:
+                combined = [*self._records, *incoming]
+                evicted = max(0, len(combined) - self.capacity)
+                self._records = combined[-self.capacity :]
+                self._accepted += len(incoming)
+                self._dropped += evicted
+            elif self.drop_policy is LogDropPolicy.DROP_NEWEST:
+                room = max(0, self.capacity - len(self._records))
+                accepted = incoming[:room]
+                self._records.extend(accepted)
+                self._accepted += len(accepted)
+                self._dropped += len(incoming) - len(accepted)
+            else:
+                self._records.extend(incoming)
+                self._accepted += len(incoming)
 
     async def get_optional(self, record_id: LogRecordId) -> LogRecord | None:
         async with self._lock:
@@ -612,19 +855,39 @@ class InMemoryLogSink:
     async def get(self, record_id: LogRecordId) -> LogRecord:
         record = await self.get_optional(record_id)
         if record is None:
-            raise LogSinkError("Log record was not found")
+            raise ResourceNotFoundError("Log record was not found", {"record_id": str(record_id)})
         return record
 
     async def list(self, filter: LogFilter | None = None) -> tuple[LogRecord, ...]:
         async with self._lock:
             values = tuple(self._records)
         selected = tuple(item for item in values if filter is None or filter.matches(item))
-        selected = tuple(sorted(selected, key=lambda item: (item.timestamp, str(item.record_id))))
+        selected = tuple(
+            sorted(
+                selected,
+                key=lambda item: (
+                    item.timestamp,
+                    item.sequence is None,
+                    item.sequence if item.sequence is not None else 0,
+                    str(item.record_id),
+                ),
+            )
+        )
         if filter is None:
             return selected
         return selected[
             filter.offset : None if filter.limit is None else filter.offset + filter.limit
         ]
+
+    async def count(self, filter: LogFilter | None = None) -> int:
+        async with self._lock:
+            return sum(1 for item in self._records if filter is None or filter.matches(item))
+
+    async def clear(self) -> int:
+        async with self._lock:
+            removed = len(self._records)
+            self._records.clear()
+            return removed
 
     async def snapshot(self) -> LogSinkSnapshot:
         async with self._lock:
@@ -639,8 +902,7 @@ class InMemoryLogSink:
             )
 
     async def flush(self) -> None:
-        if self._closed:
-            raise LogSinkError("Log sink is closed")
+        return None
 
     async def close(self) -> None:
         async with self._lock:

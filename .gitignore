@@ -5,3 +5,5 @@ __pycache__/
 dist/
 target/
 *.db
+*.egg-info/
+*.dist-info/
