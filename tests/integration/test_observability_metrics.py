@@ -48,3 +48,15 @@ async def test_histogram_registration_observation_and_collection(case: int) -> N
     assert point.count == 1
     assert point.bucket_counts[-1] == 1
     assert len(await registry.collect()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", range(30))
+async def test_registry_reset_releases_labeled_counter_series(case: int) -> None:
+    registry = InMemoryMetricRegistry()
+    counter = await registry.counter(
+        f"reset_requests_{case}", description="Requests", label_names=("method",)
+    )
+    await counter.add(labels={"method": f"method-{case}"})
+    assert await registry.reset(f"reset_requests_{case}", labels={"method": f"method-{case}"})
+    assert await counter.series_count() == 0

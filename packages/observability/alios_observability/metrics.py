@@ -120,6 +120,8 @@ class MetricLabelSet:
 
     @classmethod
     def create(cls, values: Mapping[str, object] | None = None, **kwargs: object) -> Self:
+        if values is not None and set(values).intersection(kwargs):
+            raise MetricValueError("Ambiguous metric label values")
         return cls({**(dict(values) if values is not None else {}), **kwargs})
 
     def __hash__(self) -> int:
@@ -135,6 +137,8 @@ class MetricLabelSet:
         return cls(value)
 
     def with_values(self, values: Mapping[str, object] | None = None, **kwargs: object) -> Self:
+        if values is not None and set(values).intersection(kwargs):
+            raise MetricValueError("Ambiguous metric label values")
         return type(self).create({**self.values, **(dict(values) if values else {}), **kwargs})
 
 
@@ -389,11 +393,66 @@ class HistogramPoint:
 MetricSample = MetricPoint | HistogramPoint
 
 
+@dataclass(frozen=True, slots=True)
+class MetricFilter:
+    names: frozenset[str] | None = None
+    kinds: frozenset[MetricKind] | None = None
+    label_equals: MetricLabelSet = field(default_factory=MetricLabelSet)
+    created_after: datetime | None = None
+    created_before: datetime | None = None
+    updated_after: datetime | None = None
+    updated_before: datetime | None = None
+    limit: int | None = None
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        names = frozenset(_name(name) for name in (self.names or ())) or None
+        kinds = frozenset(self.kinds or ()) or None
+        if kinds and not all(isinstance(kind, MetricKind) for kind in kinds):
+            raise MetricValueError("Invalid metric filter")
+        for lower, upper in (
+            (self.created_after, self.created_before),
+            (self.updated_after, self.updated_before),
+        ):
+            if lower is not None:
+                _aware(lower)
+            if upper is not None:
+                _aware(upper)
+            if lower is not None and upper is not None and lower >= upper:
+                raise MetricValueError("Invalid metric filter")
+        if (
+            (self.limit is not None and (isinstance(self.limit, bool) or self.limit < 0))
+            or isinstance(self.offset, bool)
+            or self.offset < 0
+        ):
+            raise MetricValueError("Invalid metric filter")
+        object.__setattr__(self, "names", names)
+        object.__setattr__(self, "kinds", kinds)
+
+    def matches(self, sample: MetricSample) -> bool:
+        if not isinstance(sample, (MetricPoint, HistogramPoint)):
+            raise MetricValueError("Invalid metric sample")
+        labels = sample.labels.values
+        return (
+            (self.names is None or sample.descriptor.name in self.names)
+            and (self.kinds is None or sample.descriptor.kind in self.kinds)
+            and all(labels.get(key) == value for key, value in self.label_equals.values.items())
+            and (self.created_after is None or sample.created_at > self.created_after)
+            and (self.created_before is None or sample.created_at < self.created_before)
+            and (self.updated_after is None or sample.updated_at > self.updated_after)
+            and (self.updated_before is None or sample.updated_at < self.updated_before)
+        )
+
+
 class MetricInstrument(Protocol):
     @property
     def descriptor(self) -> MetricDescriptor: ...
     async def collect(self) -> tuple[MetricSample, ...]: ...
     async def series_count(self) -> int: ...
+    async def reset(
+        self, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> bool: ...
+    async def reset_all(self) -> int: ...
 
 
 class Counter(MetricInstrument, Protocol):
@@ -484,7 +543,7 @@ class _Instrument:
             now = _aware(self._clock())
             prior = 0 if current is None else current.value
             value = _number(operation(prior))
-            if current is not None and now < current.created_at:
+            if current is not None and now < current.updated_at:
                 raise MetricValueError("Metric clock moved backwards")
             point = MetricPoint(
                 self._descriptor,
@@ -496,6 +555,17 @@ class _Instrument:
             )
             self._series[label_set] = point
             return point
+
+    async def reset(self, *, labels: MetricLabelSet | Mapping[str, object] | None = None) -> bool:
+        label_set = self._labels(labels)
+        async with self._lock:
+            return self._series.pop(label_set, None) is not None
+
+    async def reset_all(self) -> int:
+        async with self._lock:
+            count = len(self._series)
+            self._series.clear()
+            return count
 
 
 class _Counter(_Instrument):
@@ -571,19 +641,36 @@ class _Histogram:
                 if value <= boundary:
                     buckets[index] += 1
             buckets[-1] += 1
+            minimum = (
+                value if current is None or current.minimum is None else min(current.minimum, value)
+            )
+            maximum = (
+                value if current is None or current.maximum is None else max(current.maximum, value)
+            )
             point = HistogramPoint(
                 self._descriptor,
                 label_set,
                 tuple(buckets),
                 1 if current is None else current.count + 1,
                 value if current is None else _number(current.sum + value),
-                value if current is None else min(current.minimum or value, value),
-                value if current is None else max(current.maximum or value, value),
+                minimum,
+                maximum,
                 now if current is None else current.created_at,
                 now,
             )
             self._series[label_set] = point
             return point
+
+    async def reset(self, *, labels: MetricLabelSet | Mapping[str, object] | None = None) -> bool:
+        label_set = self._labels(labels)
+        async with self._lock:
+            return self._series.pop(label_set, None) is not None
+
+    async def reset_all(self) -> int:
+        async with self._lock:
+            count = len(self._series)
+            self._series.clear()
+            return count
 
     async def collect(self) -> tuple[HistogramPoint, ...]:
         async with self._lock:
@@ -640,6 +727,46 @@ class MetricRegistryStatus:
             )
         except (KeyError, TypeError, ValueError, MetricValueError) as error:
             raise MetricValueError("Invalid metric registry status") from error
+
+
+@dataclass(frozen=True, slots=True)
+class MetricRegistrySnapshot:
+    status: MetricRegistryStatus
+    descriptors: tuple[MetricDescriptor, ...]
+    samples: tuple[MetricSample, ...]
+    collected_at: datetime
+    filtered: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.status, MetricRegistryStatus)
+            or not all(isinstance(item, MetricDescriptor) for item in self.descriptors)
+            or not all(isinstance(item, (MetricPoint, HistogramPoint)) for item in self.samples)
+            or not isinstance(self.filtered, bool)
+        ):
+            raise MetricValueError("Invalid metric registry snapshot")
+        _aware(self.collected_at)
+        names = tuple(item.name for item in self.descriptors)
+        if len(set(names)) != len(names) or tuple(sorted(names)) != names:
+            raise MetricValueError("Invalid metric registry snapshot")
+        if any(sample.descriptor.name not in names for sample in self.samples):
+            raise MetricValueError("Invalid metric registry snapshot")
+
+    def to_dict(self) -> dict[str, object]:
+        samples: list[dict[str, object]] = []
+        for sample in self.samples:
+            rendered = sample.to_dict()
+            rendered["sample_type"] = (
+                "histogram" if isinstance(sample, HistogramPoint) else "scalar"
+            )
+            samples.append(rendered)
+        return {
+            "status": self.status.to_dict(),
+            "descriptors": [item.to_dict() for item in self.descriptors],
+            "samples": samples,
+            "collected_at": self.collected_at.isoformat(),
+            "filtered": self.filtered,
+        }
 
 
 class InMemoryMetricRegistry:
@@ -791,20 +918,59 @@ class InMemoryMetricRegistry:
             raise MetricDefinitionError("Metric kind mismatch")
         return cast(Histogram, item)
 
-    async def list_descriptors(self) -> tuple[MetricDescriptor, ...]:
+    async def list_descriptors(
+        self, filter: MetricFilter | None = None
+    ) -> tuple[MetricDescriptor, ...]:
         async with self._lock:
-            return tuple(self._items[name].descriptor for name in sorted(self._items))
+            descriptors = tuple(self._items[name].descriptor for name in sorted(self._items))
+        if filter is None:
+            return descriptors
+        selected = tuple(
+            item
+            for item in descriptors
+            if (filter.names is None or item.name in filter.names)
+            and (filter.kinds is None or item.kind in filter.kinds)
+        )
+        return selected[
+            filter.offset : None if filter.limit is None else filter.offset + filter.limit
+        ]
 
-    async def collect(self) -> tuple[MetricSample, ...]:
+    async def collect(self, filter: MetricFilter | None = None) -> tuple[MetricSample, ...]:
         async with self._lock:
             items = tuple(self._items.items())
         points: list[MetricSample] = [point for _, item in items for point in await item.collect()]
-        return tuple(
+        selected = tuple(point for point in points if filter is None or filter.matches(point))
+        ordered = tuple(
             sorted(
-                points,
-                key=lambda point: (point.descriptor.name, tuple(point.labels.values.items())),
+                selected,
+                key=lambda point: (
+                    point.descriptor.name,
+                    tuple(point.labels.values.items()),
+                    point.descriptor.kind.value,
+                ),
             )
         )
+        if filter is None:
+            return ordered
+        return ordered[
+            filter.offset : None if filter.limit is None else filter.offset + filter.limit
+        ]
+
+    async def reset(
+        self, name: str, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> bool:
+        item = await self.get(name)
+        return await item.reset(labels=labels)
+
+    async def reset_all(self, name: str | None = None) -> int:
+        if name is not None:
+            return await (await self.get(name)).reset_all()
+        async with self._lock:
+            items = tuple(self._items.values())
+        removed = 0
+        for item in items:
+            removed += await item.reset_all()
+        return removed
 
     async def status(self) -> MetricRegistryStatus:
         async with self._lock:
@@ -819,6 +985,19 @@ class InMemoryMetricRegistry:
             self._maximum,
             closed,
             self._created_at,
+        )
+
+    async def snapshot(self, filter: MetricFilter | None = None) -> MetricRegistrySnapshot:
+        status = await self.status()
+        descriptors = await self.list_descriptors(filter)
+        samples = await self.collect(filter)
+        selected_names = frozenset(item.name for item in descriptors)
+        samples = tuple(sample for sample in samples if sample.descriptor.name in selected_names)
+        collected_at = _aware(self._clock())
+        if collected_at < self._created_at:
+            raise MetricValueError("Metric clock moved backwards")
+        return MetricRegistrySnapshot(
+            status, descriptors, samples, collected_at, filter is not None
         )
 
     async def close(self) -> None:

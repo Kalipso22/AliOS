@@ -2,7 +2,13 @@ from datetime import UTC, datetime
 
 import pytest
 from alios_core.errors import MetricDefinitionError, MetricValueError
-from alios_observability import MetricDescriptor, MetricKind, MetricLabelSet, MetricPoint
+from alios_observability import (
+    MetricDescriptor,
+    MetricFilter,
+    MetricKind,
+    MetricLabelSet,
+    MetricPoint,
+)
 
 
 @pytest.mark.parametrize("kind", list(MetricKind))
@@ -60,3 +66,11 @@ def test_histogram_descriptor_preserves_distinct_valid_boundaries(case: int) -> 
         f"latency_{case}", MetricKind.HISTOGRAM, "Latency", histogram_boundaries=(case, case + 1)
     )
     assert descriptor.histogram_boundaries == (case, case + 1)
+
+
+@pytest.mark.parametrize("case", range(120))
+def test_metric_filter_matches_distinct_metric_names(case: int) -> None:
+    descriptor = MetricDescriptor(f"requests_{case}", MetricKind.COUNTER, "Requests")
+    now = datetime.now(UTC)
+    point = MetricPoint(descriptor, MetricLabelSet(), case, now, now, 1)
+    assert MetricFilter(names=frozenset({f"requests_{case}"})).matches(point)
