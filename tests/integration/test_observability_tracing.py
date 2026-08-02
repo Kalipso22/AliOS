@@ -1,8 +1,14 @@
 import asyncio
+import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from alios_core.errors import ValidationError
 from alios_observability import (
+    LogException,
+    RedactionPolicy,
+    RedactionRule,
     SpanEvent,
     SpanKind,
     SpanLink,
@@ -16,21 +22,25 @@ from alios_observability import (
 )
 
 
-def _integration_contract(name: str) -> bool:
-    context = TraceContext.create_root()
-    if "child" in name or "sibling" in name or "multiple" in name:
-        return context.create_child().trace_id == context.trace_id
-    if "record" in name or "redact" in name:
-        now = datetime.now(UTC)
-        return (
-            SpanRecord(
-                context, "run", TraceSource("core"), SpanKind.INTERNAL, SpanStatus.OK, now, now
-            ).duration_ns
-            == 0
-        )
-    if "export" in name:
-        return SpanEvent.__module__.startswith("alios_observability")
-    return TraceContext.from_dict(context.to_dict()) == context
+def _error_record(secret: str = "TRACE-C1A3-SECRET-74c912") -> SpanRecord:
+    now = datetime.now(UTC)
+    context = TraceContext.create_root(baggage={"api_key": secret})
+    linked_context = TraceContext.create_root(baggage={"api_key": secret})
+    exception = LogException.from_exception(ValidationError("failure", {"api_key": secret}))
+    return SpanRecord(
+        context,
+        f"api_key={secret}",
+        TraceSource("integration"),
+        SpanKind.INTERNAL,
+        SpanStatus.ERROR,
+        now,
+        now,
+        f"api_key={secret}",
+        {"api_key": secret},
+        (SpanEvent(f"api_key={secret}", now, {"api_key": secret}),),
+        (SpanLink(linked_context, {"api_key": secret}),),
+        exception,
+    )
 
 
 @pytest.mark.asyncio
@@ -117,65 +127,153 @@ def test_public_tracing_imports_have_no_global_context() -> None:
     assert current_trace_context() is None
 
 
-def test_sibling_async_tasks_inherit_same_parent_snapshot() -> None:
-    assert _integration_contract("test_sibling_async_tasks_inherit_same_parent_snapshot")
+@pytest.mark.asyncio
+async def test_sibling_async_tasks_inherit_same_parent_snapshot() -> None:
+    parent = TraceContext.create_root()
+
+    async def read() -> TraceContext:
+        return require_trace_context()
+
+    async with bind_trace_context(parent):
+        first, second = await asyncio.gather(
+            asyncio.create_task(read()), asyncio.create_task(read())
+        )
+    assert first == parent and second == parent
 
 
 def test_child_context_has_unique_span_id() -> None:
-    assert _integration_contract("test_child_context_has_unique_span_id")
+    parent = TraceContext.create_root()
+    assert parent.create_child().span_id != parent.create_child().span_id
 
 
 def test_multiple_children_share_trace_id() -> None:
-    assert _integration_contract("test_multiple_children_share_trace_id")
+    parent = TraceContext.create_root()
+    assert parent.create_child().trace_id == parent.create_child().trace_id == parent.trace_id
 
 
-def test_trace_binding_restores_after_child_failure() -> None:
-    assert _integration_contract("test_trace_binding_restores_after_child_failure")
+@pytest.mark.asyncio
+async def test_trace_binding_restores_after_child_failure() -> None:
+    root = TraceContext.create_root()
+    async with bind_trace_context(root):
+        with pytest.raises(RuntimeError):
+            async with bind_trace_context(root.create_child()):
+                raise RuntimeError("failure")
+        assert require_trace_context() == root
 
 
-def test_trace_binding_restores_after_child_cancellation() -> None:
-    assert _integration_contract("test_trace_binding_restores_after_child_cancellation")
+@pytest.mark.asyncio
+async def test_trace_binding_restores_after_child_cancellation() -> None:
+    root, started, release = TraceContext.create_root(), asyncio.Event(), asyncio.Event()
+
+    async def worker() -> None:
+        async with bind_trace_context(root.create_child()):
+            started.set()
+            await release.wait()
+
+    async with bind_trace_context(root):
+        task = asyncio.create_task(worker())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert require_trace_context() == root
 
 
-def test_trace_context_round_trip_across_async_boundary() -> None:
-    assert _integration_contract("test_trace_context_round_trip_across_async_boundary")
+@pytest.mark.asyncio
+async def test_trace_context_round_trip_across_async_boundary() -> None:
+    queue: asyncio.Queue[Mapping[str, object]] = asyncio.Queue()
+    context = TraceContext.create_root(baggage={"region": "eu"})
+    await queue.put(context.to_dict())
+    assert TraceContext.from_dict(await queue.get()) == context
 
 
 def test_span_record_with_alios_exception_round_trip() -> None:
-    assert _integration_contract("test_span_record_with_alios_exception_round_trip")
+    record = _error_record()
+    unredacted = RedactionPolicy(include_default_rules=False)
+    assert SpanRecord.from_dict(record.to_dict(unredacted)) == record
 
 
 def test_span_record_with_ordinary_normalized_exception_is_safe() -> None:
-    assert _integration_contract("test_span_record_with_ordinary_normalized_exception_is_safe")
+    secret = "TRACE-C1A3-SECRET-74c912"
+    exception = LogException.from_exception(ValueError(secret))
+    now = datetime.now(UTC)
+    record = SpanRecord(
+        TraceContext.create_root(),
+        "operation",
+        TraceSource("integration"),
+        SpanKind.INTERNAL,
+        SpanStatus.ERROR,
+        now,
+        now,
+        exception=exception,
+    )
+    assert exception.message == "An unexpected error occurred" and secret not in str(exception)
+    assert SpanRecord.from_dict(record.to_dict()) == record
 
 
 def test_span_record_rendering_redacts_all_sensitive_locations() -> None:
-    assert _integration_contract("test_span_record_rendering_redacts_all_sensitive_locations")
+    secret = "TRACE-C1A3-SECRET-74c912"
+    record = _error_record(secret)
+    first = record.to_dict()
+    second = record.to_dict()
+    assert all(secret not in value for value in (str(first), repr(first), json.dumps(first)))
+    assert record.context.baggage["api_key"] == secret
+    first["name"] = "changed"
+    assert second["name"] != "changed" and record.name == f"api_key={secret}"
 
 
 def test_span_record_rendering_does_not_mutate_internal_record() -> None:
-    assert _integration_contract("test_span_record_rendering_does_not_mutate_internal_record")
+    record = _error_record()
+    rendered = record.to_dict()
+    attributes = rendered["attributes"]
+    assert isinstance(attributes, dict)
+    attributes["api_key"] = "changed"
+    assert record.attributes["api_key"] == "TRACE-C1A3-SECRET-74c912"
 
 
 def test_redacted_span_record_is_parseable() -> None:
-    assert _integration_contract("test_redacted_span_record_is_parseable")
+    rendered = _error_record().to_dict()
+    restored = SpanRecord.from_dict(rendered)
+    assert restored.status is SpanStatus.ERROR and restored.name == "[REDACTED]"
 
 
 def test_custom_redaction_policy_applies_to_span_record() -> None:
-    assert _integration_contract("test_custom_redaction_policy_applies_to_span_record")
+    secret = "TRACE-C1A3-SECRET-74c912"
+    policy = RedactionPolicy(
+        (RedactionRule("test-secret", value_patterns=(secret,), replacement="[MASKED]"),),
+        include_default_rules=False,
+    )
+    rendered = _error_record(secret).to_dict(policy)
+    assert "[MASKED]" in str(rendered) and secret not in str(rendered)
 
 
 def test_default_redaction_policy_does_not_mutate_global_state() -> None:
-    assert _integration_contract("test_default_redaction_policy_does_not_mutate_global_state")
+    from alios_observability import default_redaction_policy
+
+    policy = default_redaction_policy()
+    original_rules = policy.rules
+    _error_record().to_dict(RedactionPolicy(include_default_rules=False))
+    assert default_redaction_policy() is policy and policy.rules == original_rules
 
 
-def test_trace_models_do_not_create_global_tasks() -> None:
-    assert _integration_contract("test_trace_models_do_not_create_global_tasks")
+@pytest.mark.asyncio
+async def test_trace_models_do_not_create_global_tasks() -> None:
+    import importlib
+
+    before = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+    tracing = importlib.import_module("alios_observability.tracing")
+    await asyncio.sleep(0)
+    after = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+    assert tracing.TraceContext is TraceContext and after == before
 
 
 def test_public_tracing_imports_preserve_logging_exports() -> None:
-    assert _integration_contract("test_public_tracing_imports_preserve_logging_exports")
+    from alios_observability import InMemoryLogSink, StructuredLogger
+
+    assert isinstance(InMemoryLogSink, type) and isinstance(StructuredLogger, type)
 
 
 def test_public_tracing_imports_preserve_metrics_exports() -> None:
-    assert _integration_contract("test_public_tracing_imports_preserve_metrics_exports")
+    from alios_observability import InMemoryMetricRegistry
+
+    assert isinstance(InMemoryMetricRegistry, type)
