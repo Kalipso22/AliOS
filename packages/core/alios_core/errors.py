@@ -164,6 +164,14 @@ class AuditLedgerVerificationError(AuditIntegrityError):
     code = "audit_ledger_verification_error"
 
 
+class AuditFilterError(AuditLedgerError):
+    code = "audit_filter_error"
+
+
+class AuditSnapshotError(AuditLedgerError):
+    code = "audit_snapshot_error"
+
+
 class TracingError(ObservabilityError):
     code = "tracing_error"
 

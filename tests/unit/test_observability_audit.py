@@ -1,20 +1,24 @@
 import asyncio
+import hmac
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum, IntEnum, IntFlag, StrEnum
+from types import MappingProxyType
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 from alios_core import (
+    AuditFilterError,
     AuditLedgerCapacityError,
     AuditLedgerClosedError,
     AuditLedgerError,
     AuditLedgerId,
     AuditLedgerVerificationError,
     AuditRecordId,
+    AuditSnapshotError,
     CorrelationId,
     LogRecordId,
     RunId,
@@ -37,7 +41,9 @@ from alios_observability import (
     AuditActorKind,
     AuditCategory,
     AuditContext,
+    AuditFilter,
     AuditLedgerEntry,
+    AuditLedgerSnapshot,
     AuditLedgerStatus,
     AuditLedgerVerificationFailure,
     AuditLedgerVerificationResult,
@@ -47,6 +53,7 @@ from alios_observability import (
     AuditTarget,
     InMemoryAuditLedger,
     RedactionPolicy,
+    RedactionRule,
     TraceContext,
     TraceSource,
     bind_audit_context,
@@ -133,6 +140,61 @@ def _secret_ledger_record() -> AuditRecord:
         context=AuditContext(metadata={"password": secret}),
         attributes={"password": secret},
     )
+
+
+def _filter_entry(*, sequence: int = 1) -> AuditLedgerEntry:
+    trace_id, span_id, parent_id = TraceId(), SpanId(), SpanId()
+    record = replace(
+        _record(),
+        category=AuditCategory.SECURITY,
+        severity=AuditSeverity.NOTICE,
+        outcome=AuditOutcome.SUCCESS,
+        actor=AuditActor(
+            AuditActorKind.USER,
+            "Alice",
+            TenantId(),
+            UserId(),
+            {"role": "admin"},
+        ),
+        action=AuditAction("document.read", {"mode": "safe"}),
+        source=TraceSource("api", "documents", "read"),
+        target=AuditTarget("document", "doc-1", {"class": "internal"}),
+        reason_code="allowed",
+        attributes={"region": "eu"},
+        tags=frozenset({"security", "access"}),
+        context=AuditContext(
+            correlation_id=CorrelationId(),
+            run_id=RunId(),
+            tenant_id=TenantId(),
+            user_id=UserId(),
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_id,
+            metadata={"environment": "test"},
+        ),
+    )
+    return _ledger_entry(
+        sequence=sequence,
+        record=record,
+        previous_digest="0" * 64 if sequence == 1 else "1" * 64,
+    )
+
+
+def _empty_snapshot(*, filtered: bool = False) -> AuditLedgerSnapshot:
+    ledger_id = AuditLedgerId()
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    status = AuditLedgerStatus(ledger_id, 0, 10, 1, None, False, instant, None)
+    verification = AuditLedgerVerificationResult(True, 0, ledger_id, None, None, None)
+    return AuditLedgerSnapshot(status, (), instant, filtered, 0, verification)
+
+
+def _populated_snapshot(*, filtered: bool = False) -> AuditLedgerSnapshot:
+    ledger_id = AuditLedgerId()
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    entry = _ledger_entry(ledger_id=ledger_id, appended_at=instant)
+    status = AuditLedgerStatus(ledger_id, 1, 10, 2, entry.entry_digest, False, instant, instant)
+    verification = AuditLedgerVerificationResult(True, 1, ledger_id, 1, 1, entry.entry_digest)
+    return AuditLedgerSnapshot(status, (entry,), instant, filtered, 1, verification)
 
 
 def test_audit_record_id_generation() -> None:
@@ -2589,6 +2651,1198 @@ def test_audit_ledger_clock_failure_error_omits_secret() -> None:
 
     with pytest.raises(AuditLedgerError) as captured:
         InMemoryAuditLedger(clock=fail)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_filter_defaults() -> None:
+    value = AuditFilter()
+    assert value.sequences is None and value.limit is None and value.offset == 0
+
+
+def test_audit_filter_empty_collections_normalize_to_none() -> None:
+    assert AuditFilter(tags_all=frozenset(), record_ids=frozenset()).tags_all is None
+
+
+def test_audit_filter_sequences() -> None:
+    assert AuditFilter(sequences=cast(Any, [2, 1])).sequences == frozenset({1, 2})
+
+
+def test_audit_filter_rejects_zero_sequence() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(sequences=cast(Any, [0]))
+
+
+def test_audit_filter_rejects_boolean_sequence() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(sequences=cast(Any, [True]))
+
+
+def test_audit_filter_rejects_duplicate_sequence_list() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(sequences=cast(Any, [1, 1]))
+
+
+def test_audit_filter_record_ids() -> None:
+    identifier = AuditRecordId()
+    assert AuditFilter(record_ids=frozenset({identifier})).record_ids == frozenset({identifier})
+
+
+def test_audit_filter_rejects_wrong_record_id() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(record_ids=cast(Any, [AuditLedgerId()]))
+
+
+def test_audit_filter_categories() -> None:
+    assert AuditFilter(categories=frozenset({AuditCategory.SECURITY})).categories
+
+
+def test_audit_filter_severities() -> None:
+    assert AuditFilter(severities=frozenset({AuditSeverity.NOTICE})).severities
+
+
+def test_audit_filter_outcomes() -> None:
+    assert AuditFilter(outcomes=frozenset({AuditOutcome.SUCCESS})).outcomes
+
+
+def test_audit_filter_actor_kinds() -> None:
+    assert AuditFilter(actor_kinds=frozenset({AuditActorKind.USER})).actor_kinds
+
+
+def test_audit_filter_rejects_wrong_category() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(categories=cast(Any, ["security"]))
+
+
+def test_audit_filter_rejects_wrong_severity() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(severities=cast(Any, [AuditOutcome.SUCCESS]))
+
+
+def test_audit_filter_rejects_wrong_outcome() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(outcomes=cast(Any, [AuditSeverity.INFO]))
+
+
+def test_audit_filter_rejects_wrong_actor_kind() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(actor_kinds=cast(Any, [AuditCategory.SYSTEM]))
+
+
+def test_audit_filter_collections_are_immutable() -> None:
+    assert isinstance(AuditFilter(action_names=cast(Any, ["read"])).action_names, frozenset)
+
+
+def test_audit_filter_caller_collections_are_isolated() -> None:
+    values = ["read"]
+    filter = AuditFilter(action_names=cast(Any, values))
+    values.append("write")
+    assert filter.action_names == frozenset({"read"})
+
+
+def test_audit_filter_actor_identifiers() -> None:
+    assert AuditFilter(actor_identifiers=cast(Any, ["Alice"])).actor_identifiers == frozenset(
+        {"Alice"}
+    )
+
+
+def test_audit_filter_actor_tenant_ids() -> None:
+    identifier = TenantId()
+    assert AuditFilter(actor_tenant_ids=cast(Any, [identifier])).actor_tenant_ids == frozenset(
+        {identifier}
+    )
+
+
+def test_audit_filter_actor_user_ids() -> None:
+    identifier = UserId()
+    assert AuditFilter(actor_user_ids=cast(Any, [identifier])).actor_user_ids == frozenset(
+        {identifier}
+    )
+
+
+def test_audit_filter_action_names() -> None:
+    assert AuditFilter(action_names=cast(Any, ["document.read"])).action_names
+
+
+def test_audit_filter_source_components() -> None:
+    assert AuditFilter(source_components=cast(Any, ["api"])).source_components
+
+
+def test_audit_filter_source_modules() -> None:
+    assert AuditFilter(source_modules=cast(Any, ["documents"])).source_modules
+
+
+def test_audit_filter_source_operations() -> None:
+    assert AuditFilter(source_operations=cast(Any, ["read"])).source_operations
+
+
+def test_audit_filter_target_kinds() -> None:
+    assert AuditFilter(target_kinds=cast(Any, ["document"])).target_kinds
+
+
+def test_audit_filter_target_identifiers() -> None:
+    assert AuditFilter(target_identifiers=cast(Any, ["doc-1"])).target_identifiers
+
+
+def test_audit_filter_has_target_true() -> None:
+    assert AuditFilter(has_target=True).has_target is True
+
+
+def test_audit_filter_has_target_false() -> None:
+    assert AuditFilter(has_target=False).has_target is False
+
+
+def test_audit_filter_rejects_non_boolean_has_target() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(has_target=cast(Any, 1))
+
+
+def test_audit_filter_correlation_ids() -> None:
+    identifier = CorrelationId()
+    assert AuditFilter(correlation_ids=cast(Any, [identifier])).correlation_ids
+
+
+def test_audit_filter_run_ids() -> None:
+    identifier = RunId()
+    assert AuditFilter(run_ids=cast(Any, [identifier])).run_ids
+
+
+def test_audit_filter_tenant_ids() -> None:
+    identifier = TenantId()
+    assert AuditFilter(tenant_ids=cast(Any, [identifier])).tenant_ids
+
+
+def test_audit_filter_user_ids() -> None:
+    identifier = UserId()
+    assert AuditFilter(user_ids=cast(Any, [identifier])).user_ids
+
+
+def test_audit_filter_trace_ids() -> None:
+    identifier = TraceId()
+    assert AuditFilter(trace_ids=cast(Any, [identifier])).trace_ids
+
+
+def test_audit_filter_span_ids() -> None:
+    identifier = SpanId()
+    assert AuditFilter(span_ids=cast(Any, [identifier])).span_ids
+
+
+def test_audit_filter_parent_span_ids() -> None:
+    identifier = SpanId()
+    assert AuditFilter(parent_span_ids=cast(Any, [identifier])).parent_span_ids
+
+
+def test_audit_filter_rejects_wrong_context_identifier() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(trace_ids=cast(Any, [SpanId()]))
+
+
+def test_audit_filter_reason_codes() -> None:
+    assert AuditFilter(reason_codes=cast(Any, ["allowed"])).reason_codes
+
+
+def test_audit_filter_tags_all() -> None:
+    assert AuditFilter(tags_all=cast(Any, ["security"])).tags_all
+
+
+def test_audit_filter_tags_any() -> None:
+    assert AuditFilter(tags_any=cast(Any, ["access"])).tags_any
+
+
+def test_audit_filter_rejects_invalid_reason_code() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(reason_codes=cast(Any, ["bad reason"]))
+
+
+def test_audit_filter_rejects_invalid_tag() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(tags_all=cast(Any, ["bad tag"]))
+
+
+def test_audit_filter_rejects_duplicate_tag_sequence() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(tags_any=cast(Any, ["access", "access"]))
+
+
+def test_audit_filter_combines_tags_all_and_any() -> None:
+    filter = AuditFilter(tags_all=cast(Any, ["security"]), tags_any=cast(Any, ["access"]))
+    assert filter.matches(_filter_entry())
+
+
+def test_audit_filter_record_attributes_are_immutable() -> None:
+    with pytest.raises(TypeError):
+        cast(
+            dict[str, object], AuditFilter(record_attribute_equals={"x": 1}).record_attribute_equals
+        )["x"] = 2
+
+
+def test_audit_filter_actor_attributes_are_immutable() -> None:
+    assert isinstance(AuditFilter(actor_attribute_equals={"x": 1}).actor_attribute_equals, Mapping)
+
+
+def test_audit_filter_action_attributes_are_immutable() -> None:
+    assert AuditFilter(action_attribute_equals={"nested": [1]}).action_attribute_equals[
+        "nested"
+    ] == (1,)
+
+
+def test_audit_filter_target_attributes_are_immutable() -> None:
+    with pytest.raises(TypeError):
+        cast(dict[str, object], AuditFilter(target_attribute_equals={}).target_attribute_equals)[
+            "x"
+        ] = 1
+
+
+def test_audit_filter_context_metadata_is_immutable() -> None:
+    assert (
+        type(AuditFilter(context_metadata_equals={}).context_metadata_equals).__name__
+        == "mappingproxy"
+    )
+
+
+def test_audit_filter_rejects_non_mapping_record_attributes() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(record_attribute_equals=cast(Any, []))
+
+
+def test_audit_filter_rejects_non_mapping_actor_attributes() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(actor_attribute_equals=cast(Any, False))
+
+
+def test_audit_filter_rejects_non_mapping_action_attributes() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(action_attribute_equals=cast(Any, ""))
+
+
+def test_audit_filter_rejects_non_mapping_target_attributes() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(target_attribute_equals=cast(Any, ()))
+
+
+def test_audit_filter_rejects_non_mapping_context_metadata() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(context_metadata_equals=cast(Any, 0))
+
+
+def test_audit_filter_attribute_caller_mapping_isolated() -> None:
+    values = {"nested": [1]}
+    filter = AuditFilter(record_attribute_equals=values)
+    values["nested"].append(2)
+    assert filter.record_attribute_equals["nested"] == (1,)
+
+
+def test_audit_filter_rejects_unsupported_attribute_value() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(record_attribute_equals={"invalid": object()})
+
+
+def test_audit_filter_attribute_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+
+    class Secret(Enum):
+        VALUE = secret
+
+    with pytest.raises(AuditFilterError) as captured:
+        AuditFilter(record_attribute_equals={"nested": [Secret.VALUE]})
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_filter_occurred_range() -> None:
+    after, before = datetime(2025, 1, 1, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC)
+    assert AuditFilter(occurred_after=after, occurred_before=before).occurred_after == after
+
+
+def test_audit_filter_appended_range() -> None:
+    after, before = datetime(2025, 1, 1, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC)
+    assert AuditFilter(appended_after=after, appended_before=before).appended_before == before
+
+
+def test_audit_filter_rejects_naive_occurred_after() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(occurred_after=datetime.now())
+
+
+def test_audit_filter_rejects_naive_appended_before() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(appended_before=datetime.now())
+
+
+def test_audit_filter_rejects_inverted_occurred_range() -> None:
+    instant = datetime.now(UTC)
+    with pytest.raises(AuditFilterError):
+        AuditFilter(occurred_after=instant, occurred_before=instant)
+
+
+def test_audit_filter_rejects_inverted_appended_range() -> None:
+    instant = datetime.now(UTC)
+    with pytest.raises(AuditFilterError):
+        AuditFilter(appended_after=instant, appended_before=instant)
+
+
+def test_audit_filter_minimum_sequence() -> None:
+    assert AuditFilter(minimum_sequence=2).minimum_sequence == 2
+
+
+def test_audit_filter_maximum_sequence() -> None:
+    assert AuditFilter(maximum_sequence=3).maximum_sequence == 3
+
+
+def test_audit_filter_rejects_inverted_sequence_range() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(minimum_sequence=3, maximum_sequence=2)
+
+
+def test_audit_filter_accepts_limit_zero() -> None:
+    assert AuditFilter(limit=0).limit == 0
+
+
+def test_audit_filter_rejects_negative_limit() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(limit=-1)
+
+
+def test_audit_filter_rejects_boolean_limit() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(limit=cast(Any, False))
+
+
+def test_audit_filter_rejects_negative_offset() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(offset=-1)
+
+
+def test_audit_filter_rejects_boolean_offset() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter(offset=cast(Any, True))
+
+
+def test_audit_filter_matches_sequence() -> None:
+    assert AuditFilter(sequences=frozenset({1})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_record_id() -> None:
+    entry = _filter_entry()
+    assert AuditFilter(record_ids=frozenset({entry.record.record_id})).matches(entry)
+
+
+def test_audit_filter_matches_category() -> None:
+    assert AuditFilter(categories=frozenset({AuditCategory.SECURITY})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_severity() -> None:
+    assert AuditFilter(severities=frozenset({AuditSeverity.NOTICE})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_outcome() -> None:
+    assert AuditFilter(outcomes=frozenset({AuditOutcome.SUCCESS})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_actor_kind() -> None:
+    assert AuditFilter(actor_kinds=frozenset({AuditActorKind.USER})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_actor_identifier() -> None:
+    assert AuditFilter(actor_identifiers=frozenset({"Alice"})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_actor_scope() -> None:
+    entry = _filter_entry()
+    filter = AuditFilter(
+        actor_tenant_ids=frozenset({cast(TenantId, entry.record.actor.tenant_id)}),
+        actor_user_ids=frozenset({cast(UserId, entry.record.actor.user_id)}),
+    )
+    assert filter.matches(entry)
+
+
+def test_audit_filter_matches_action_name() -> None:
+    assert AuditFilter(action_names=frozenset({"document.read"})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_source() -> None:
+    filter = AuditFilter(
+        source_components=frozenset({"api"}),
+        source_modules=frozenset({"documents"}),
+        source_operations=frozenset({"read"}),
+    )
+    assert filter.matches(_filter_entry())
+
+
+def test_audit_filter_matches_target() -> None:
+    filter = AuditFilter(
+        target_kinds=frozenset({"document"}), target_identifiers=frozenset({"doc-1"})
+    )
+    assert filter.matches(_filter_entry())
+
+
+def test_audit_filter_matches_has_target() -> None:
+    assert AuditFilter(has_target=True).matches(_filter_entry())
+
+
+def test_audit_filter_matches_context_scope() -> None:
+    entry = _filter_entry()
+    assert AuditFilter(run_ids=frozenset({cast(RunId, entry.record.context.run_id)})).matches(entry)
+
+
+def test_audit_filter_matches_reason_code() -> None:
+    assert AuditFilter(reason_codes=frozenset({"allowed"})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_tags_all() -> None:
+    assert AuditFilter(tags_all=frozenset({"security", "access"})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_tags_any() -> None:
+    assert AuditFilter(tags_any=frozenset({"access", "other"})).matches(_filter_entry())
+
+
+def test_audit_filter_matches_record_attribute_subset() -> None:
+    assert AuditFilter(record_attribute_equals={"region": "eu"}).matches(_filter_entry())
+
+
+def test_audit_filter_matches_actor_attribute_subset() -> None:
+    assert AuditFilter(actor_attribute_equals={"role": "admin"}).matches(_filter_entry())
+
+
+def test_audit_filter_matches_action_attribute_subset() -> None:
+    assert AuditFilter(action_attribute_equals={"mode": "safe"}).matches(_filter_entry())
+
+
+def test_audit_filter_matches_target_attribute_subset() -> None:
+    assert AuditFilter(target_attribute_equals={"class": "internal"}).matches(_filter_entry())
+
+
+def test_audit_filter_matches_context_metadata_subset() -> None:
+    assert AuditFilter(context_metadata_equals={"environment": "test"}).matches(_filter_entry())
+
+
+def test_audit_filter_matches_occurred_time() -> None:
+    assert AuditFilter(
+        occurred_after=datetime(2025, 1, 1, tzinfo=UTC),
+        occurred_before=datetime(2027, 1, 1, tzinfo=UTC),
+    ).matches(_filter_entry())
+
+
+def test_audit_filter_matches_appended_time() -> None:
+    assert AuditFilter(
+        appended_after=datetime(2025, 1, 1, tzinfo=UTC),
+        appended_before=datetime(2027, 1, 1, tzinfo=UTC),
+    ).matches(_filter_entry())
+
+
+def test_audit_filter_matches_sequence_range() -> None:
+    assert AuditFilter(minimum_sequence=1, maximum_sequence=1).matches(_filter_entry())
+
+
+def test_audit_filter_combines_all_predicates() -> None:
+    entry = _filter_entry()
+    filter = AuditFilter(
+        sequences=frozenset({1}),
+        categories=frozenset({AuditCategory.SECURITY}),
+        actor_identifiers=frozenset({"Alice"}),
+        action_names=frozenset({"document.read"}),
+        has_target=True,
+        tags_all=frozenset({"security"}),
+        record_attribute_equals={"region": "eu"},
+    )
+    assert filter.matches(entry)
+
+
+def test_audit_filter_rejects_wrong_entry_type() -> None:
+    with pytest.raises(AuditFilterError):
+        AuditFilter().matches(cast(Any, _record()))
+
+
+def test_audit_filter_pagination_does_not_affect_matches() -> None:
+    assert AuditFilter(limit=0, offset=99).matches(_filter_entry())
+
+
+def test_audit_filter_serialization() -> None:
+    rendered = AuditFilter(categories=frozenset({AuditCategory.SECURITY})).to_dict(_safe_policy())
+    assert set(rendered) == {
+        "sequences",
+        "record_ids",
+        "categories",
+        "severities",
+        "outcomes",
+        "actor_kinds",
+        "actor_identifiers",
+        "actor_tenant_ids",
+        "actor_user_ids",
+        "action_names",
+        "source_components",
+        "source_modules",
+        "source_operations",
+        "target_kinds",
+        "target_identifiers",
+        "has_target",
+        "correlation_ids",
+        "run_ids",
+        "tenant_ids",
+        "user_ids",
+        "trace_ids",
+        "span_ids",
+        "parent_span_ids",
+        "reason_codes",
+        "tags_all",
+        "tags_any",
+        "record_attribute_equals",
+        "actor_attribute_equals",
+        "action_attribute_equals",
+        "target_attribute_equals",
+        "context_metadata_equals",
+        "occurred_after",
+        "occurred_before",
+        "appended_after",
+        "appended_before",
+        "minimum_sequence",
+        "maximum_sequence",
+        "limit",
+        "offset",
+    }
+
+
+def test_audit_filter_round_trip() -> None:
+    filter = AuditFilter(
+        sequences=frozenset({2, 1}),
+        categories=frozenset({AuditCategory.SECURITY}),
+        actor_identifiers=frozenset({"Alice"}),
+        record_attribute_equals={"x": [1]},
+        limit=5,
+        offset=1,
+    )
+    assert AuditFilter.from_dict(filter.to_dict(_safe_policy())) == filter
+
+
+def test_audit_filter_serialization_is_deterministic() -> None:
+    first = AuditFilter(tags_any=frozenset({"b", "a"})).to_dict(_safe_policy())
+    second = AuditFilter(tags_any=frozenset({"a", "b"})).to_dict(_safe_policy())
+    assert first == second and first["tags_any"] == ["a", "b"]
+
+
+def test_audit_filter_serialization_is_independent() -> None:
+    filter = AuditFilter(record_attribute_equals={"nested": [1]})
+    rendered = filter.to_dict(_safe_policy())
+    cast(dict[str, object], rendered["record_attribute_equals"])["nested"] = []
+    assert filter.record_attribute_equals["nested"] == (1,)
+
+
+def test_audit_filter_rendering_redacts_actor_identifiers() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    policy = RedactionPolicy(
+        rules=(RedactionRule("query-secret", value_patterns=(secret,)),),
+        include_default_rules=False,
+    )
+    assert secret not in str(AuditFilter(actor_identifiers=frozenset({secret})).to_dict(policy))
+
+
+def test_audit_filter_rendering_redacts_target_identifiers() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    policy = RedactionPolicy(
+        rules=(RedactionRule("query-secret", value_patterns=(secret,)),),
+        include_default_rules=False,
+    )
+    assert secret not in str(AuditFilter(target_identifiers=frozenset({secret})).to_dict(policy))
+
+
+def test_audit_filter_rendering_redacts_attribute_predicates() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    rendered = AuditFilter(record_attribute_equals={"password": secret}).to_dict()
+    assert secret not in str(rendered)
+
+
+def test_audit_filter_from_dict_uses_strict_types() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["sequences"] = "1"
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_duplicate_sequences() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["sequences"] = [1, 1]
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_duplicate_identifiers() -> None:
+    identifier = AuditRecordId()
+    value = AuditFilter().to_dict(_safe_policy())
+    value["record_ids"] = [str(identifier), str(identifier)]
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_duplicate_enums() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["categories"] = ["security", "security"]
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_invalid_identifier() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["record_ids"] = ["invalid"]
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_unknown_enum() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["categories"] = ["unknown"]
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_non_boolean_flag() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["has_target"] = 1
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_naive_time() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["occurred_after"] = "2026-01-01T00:00:00"
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_filter_from_dict_rejects_boolean_pagination() -> None:
+    value = AuditFilter().to_dict(_safe_policy())
+    value["limit"] = False
+    with pytest.raises(AuditSerializationError):
+        AuditFilter.from_dict(value)
+
+
+def test_audit_ledger_snapshot_empty() -> None:
+    assert _empty_snapshot().entries == ()
+
+
+def test_audit_ledger_snapshot_unfiltered() -> None:
+    snapshot = _populated_snapshot()
+    assert not snapshot.filtered and snapshot.matching_entry_count == 1
+
+
+def test_audit_ledger_snapshot_filtered() -> None:
+    snapshot = _empty_snapshot(filtered=True)
+    assert snapshot.filtered and snapshot.matching_entry_count == 0
+
+
+def test_audit_ledger_snapshot_rejects_wrong_status() -> None:
+    with pytest.raises(AuditSnapshotError):
+        AuditLedgerSnapshot(
+            cast(Any, object()), (), datetime.now(UTC), False, 0, cast(Any, object())
+        )
+
+
+def test_audit_ledger_snapshot_rejects_wrong_entry() -> None:
+    snapshot = _empty_snapshot(filtered=True)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=cast(Any, (_record(),)), matching_entry_count=1)
+
+
+def test_audit_ledger_snapshot_rejects_unsorted_entries() -> None:
+    ledger_id, instant = AuditLedgerId(), datetime(2026, 1, 1, tzinfo=UTC)
+    first = _ledger_entry(ledger_id=ledger_id, appended_at=instant)
+    second = _ledger_entry(
+        ledger_id=ledger_id,
+        sequence=2,
+        record=replace(_record(), record_id=AuditRecordId()),
+        appended_at=instant,
+        previous_digest=first.entry_digest,
+    )
+    snapshot = _empty_snapshot(filtered=True)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=(second, first), matching_entry_count=2)
+
+
+def test_audit_ledger_snapshot_rejects_duplicate_sequence() -> None:
+    first = _ledger_entry()
+    second = _ledger_entry(
+        ledger_id=first.ledger_id, record=replace(_record(), record_id=AuditRecordId())
+    )
+    snapshot = _empty_snapshot(filtered=True)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=(first, second), matching_entry_count=2)
+
+
+def test_audit_ledger_snapshot_rejects_duplicate_record_id() -> None:
+    ledger_id, instant, record = AuditLedgerId(), datetime(2026, 1, 1, tzinfo=UTC), _record()
+    first = _ledger_entry(ledger_id=ledger_id, record=record, appended_at=instant)
+    second = _ledger_entry(
+        ledger_id=ledger_id,
+        sequence=2,
+        record=record,
+        appended_at=instant,
+        previous_digest=first.entry_digest,
+    )
+    snapshot = _empty_snapshot(filtered=True)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=(first, second), matching_entry_count=2)
+
+
+def test_audit_ledger_snapshot_rejects_entry_from_other_ledger() -> None:
+    snapshot = _empty_snapshot(filtered=True)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=(_ledger_entry(),), matching_entry_count=1)
+
+
+def test_audit_ledger_snapshot_rejects_naive_collection_time() -> None:
+    with pytest.raises(AuditSnapshotError):
+        replace(_empty_snapshot(), collected_at=datetime.now())
+
+
+def test_audit_ledger_snapshot_rejects_collection_before_creation() -> None:
+    snapshot = _empty_snapshot()
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, collected_at=snapshot.status.created_at - timedelta(seconds=1))
+
+
+def test_audit_ledger_snapshot_rejects_collection_before_last_append() -> None:
+    snapshot = _populated_snapshot()
+    with pytest.raises(AuditSnapshotError):
+        replace(
+            snapshot,
+            collected_at=cast(datetime, snapshot.status.last_appended_at) - timedelta(seconds=1),
+        )
+
+
+def test_audit_ledger_snapshot_rejects_boolean_matching_count() -> None:
+    with pytest.raises(AuditSnapshotError):
+        replace(_empty_snapshot(filtered=True), matching_entry_count=True)
+
+
+def test_audit_ledger_snapshot_rejects_matching_count_over_status() -> None:
+    with pytest.raises(AuditSnapshotError):
+        replace(_empty_snapshot(filtered=True), matching_entry_count=1)
+
+
+def test_unfiltered_audit_snapshot_requires_all_entries() -> None:
+    snapshot = _populated_snapshot()
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, entries=())
+
+
+def test_filtered_audit_snapshot_allows_paginated_entries() -> None:
+    snapshot = _populated_snapshot(filtered=True)
+    assert replace(snapshot, entries=()).matching_entry_count == 1
+
+
+def test_audit_ledger_snapshot_rejects_wrong_verification_ledger() -> None:
+    snapshot = _empty_snapshot()
+    other = AuditLedgerVerificationResult(True, 0, AuditLedgerId(), None, None, None)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, verification=other)
+
+
+def test_audit_ledger_snapshot_valid_verification_matches_status() -> None:
+    snapshot = _populated_snapshot()
+    wrong = AuditLedgerVerificationResult(True, 0, snapshot.status.ledger_id, None, None, None)
+    with pytest.raises(AuditSnapshotError):
+        replace(snapshot, verification=wrong)
+
+
+def test_audit_ledger_snapshot_preserves_invalid_verification() -> None:
+    snapshot = _populated_snapshot()
+    invalid = AuditLedgerVerificationResult(
+        False,
+        1,
+        snapshot.status.ledger_id,
+        1,
+        1,
+        snapshot.status.head_digest,
+        AuditLedgerVerificationFailure.ENTRY_DIGEST_MISMATCH,
+        1,
+    )
+    assert replace(snapshot, verification=invalid).verification is invalid
+
+
+def test_audit_ledger_snapshot_require_valid() -> None:
+    snapshot = _empty_snapshot()
+    snapshot.require_valid()
+    assert snapshot.verification.valid
+
+
+def test_audit_ledger_snapshot_require_valid_raises() -> None:
+    snapshot = _populated_snapshot()
+    invalid = AuditLedgerVerificationResult(
+        False,
+        1,
+        snapshot.status.ledger_id,
+        1,
+        1,
+        snapshot.status.head_digest,
+        AuditLedgerVerificationFailure.RECORD_DIGEST_MISMATCH,
+        1,
+    )
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(snapshot, verification=invalid).require_valid()
+
+
+def test_audit_ledger_snapshot_serialization() -> None:
+    assert set(_empty_snapshot().to_dict(_safe_policy())) == {
+        "status",
+        "entries",
+        "collected_at",
+        "filtered",
+        "matching_entry_count",
+        "verification",
+    }
+
+
+def test_audit_ledger_snapshot_round_trip_without_redaction() -> None:
+    snapshot = _populated_snapshot()
+    assert AuditLedgerSnapshot.from_dict(snapshot.to_dict(_safe_policy())) == snapshot
+
+
+def test_audit_ledger_snapshot_serialization_is_independent() -> None:
+    snapshot = _populated_snapshot()
+    rendered = snapshot.to_dict(_safe_policy())
+    cast(dict[str, object], rendered["status"])["entry_count"] = 0
+    assert snapshot.status.entry_count == 1
+
+
+def test_audit_ledger_snapshot_rendering_redacts_entries() -> None:
+    snapshot = _populated_snapshot()
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    entry = _ledger_entry(
+        ledger_id=snapshot.status.ledger_id,
+        record=replace(_record(), attributes={"password": secret}),
+    )
+    assert secret not in str(replace(snapshot, entries=(entry,)).to_dict())
+
+
+def test_redacted_audit_ledger_snapshot_is_display_only() -> None:
+    snapshot = _populated_snapshot()
+    entry = snapshot.entries[0]
+    object.__setattr__(entry.record, "attributes", MappingProxyType({"password": "secret"}))
+    with pytest.raises(AuditSerializationError):
+        AuditLedgerSnapshot.from_dict(snapshot.to_dict())
+
+
+def test_audit_ledger_snapshot_from_dict_uses_strict_types() -> None:
+    value = _empty_snapshot().to_dict(_safe_policy())
+    value["filtered"] = 0
+    with pytest.raises(AuditSerializationError):
+        AuditLedgerSnapshot.from_dict(value)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_all() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.list() == await ledger.entries()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_with_filter() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert len(await ledger.list(AuditFilter(categories=frozenset({AuditCategory.SECURITY})))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_sequence_order() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert tuple(entry.sequence for entry in await ledger.list()) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_applies_offset() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    second = await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert await ledger.list(AuditFilter(offset=1)) == (second,)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_applies_limit() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert await ledger.list(AuditFilter(limit=1)) == (first,)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_applies_offset_before_limit() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    second = await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert await ledger.list(AuditFilter(offset=1, limit=1)) == (second,)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_limit_zero() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.list(AuditFilter(limit=0)) == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_offset_beyond_end() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.list(AuditFilter(offset=2)) == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_rejects_wrong_filter() -> None:
+    with pytest.raises(AuditFilterError):
+        await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).list(cast(Any, {}))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_list_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    assert await ledger.list() == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_count_all() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_count_with_filter() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count(AuditFilter(outcomes=frozenset({AuditOutcome.FAILURE}))) == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_count_ignores_limit() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count(AuditFilter(limit=0)) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_count_ignores_offset() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count(AuditFilter(offset=99)) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_count_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    assert await ledger.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_query_result_is_immutable() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert isinstance(await ledger.list(), tuple)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_query_snapshot_is_point_in_time() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    result = await ledger.list()
+    await ledger.append(_record())
+    assert result == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_api_unfiltered() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: instant)
+    snapshot = await ledger.snapshot()
+    assert not snapshot.filtered and snapshot.status.entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_api_filtered() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshot = await InMemoryAuditLedger(clock=lambda: instant).snapshot(AuditFilter())
+    assert snapshot.filtered
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_matching_count_before_pagination() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot(AuditFilter(limit=0))
+    assert snapshot.matching_entry_count == 1 and snapshot.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_uses_injected_clock() -> None:
+    created, collected = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
+    clock = _LedgerClock(created, collected)
+    snapshot = await InMemoryAuditLedger(clock=clock).snapshot()
+    assert snapshot.collected_at == collected
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_rejects_naive_clock() -> None:
+    clock = _LedgerClock(datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 1))
+    ledger = InMemoryAuditLedger(clock=clock)
+    with pytest.raises(AuditSnapshotError):
+        await ledger.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_rejects_clock_before_creation() -> None:
+    later, earlier = datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=_LedgerClock(later, earlier))
+    with pytest.raises(AuditSnapshotError):
+        await ledger.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_rejects_clock_before_last_append() -> None:
+    created, appended, collected = (
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 3, tzinfo=UTC),
+        datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    ledger = InMemoryAuditLedger(clock=_LedgerClock(created, appended, collected))
+    await ledger.append(_record())
+    with pytest.raises(AuditSnapshotError):
+        await ledger.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_after_close() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: instant)
+    await ledger.close()
+    assert (await ledger.snapshot()).status.closed
+
+
+@pytest.mark.asyncio
+async def test_old_audit_ledger_snapshot_unchanged_after_append() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    old = await ledger.snapshot()
+    await ledger.append(_record())
+    assert old.status.entry_count == 0 and old.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_snapshot_verifies_complete_chain() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot(AuditFilter(limit=0))
+    assert snapshot.verification.checked_entry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_filtered_snapshot_detects_corruption_outside_selection() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "entry_digest", "1" * 64)
+    snapshot = await ledger.snapshot(AuditFilter(categories=frozenset({AuditCategory.SYSTEM})))
+    assert snapshot.entries == () and not snapshot.verification.valid
+
+
+@pytest.mark.asyncio
+async def test_empty_audit_ledger_verify_detects_stored_head() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    ledger._head_digest = "1" * 64
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_empty_audit_ledger_verify_detects_stored_count() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    ledger._entry_count = 1
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.ENTRY_COUNT_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_empty_audit_ledger_head_failure_precedes_count_failure() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    ledger._head_digest, ledger._entry_count = "1" * 64, 1
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verification_uses_constant_time_digest_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    original = cast(Callable[[str, str], bool], hmac.compare_digest)
+
+    def compare(left: str, right: str) -> bool:
+        calls.append((left, right))
+        return original(left, right)
+
+    monkeypatch.setattr(hmac, "compare_digest", compare)
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.verify()
+    assert len(calls) >= 4
+
+
+def test_audit_filter_invalid_identifier_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    value = AuditFilter().to_dict(_safe_policy())
+    value["record_ids"] = [secret]
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditFilter.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_filter_invalid_text_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    with pytest.raises(AuditFilterError) as captured:
+        AuditFilter(action_names=cast(Any, [secret + " invalid"]))
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_filter_wrong_runtime_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+
+    class InvalidFilter:
+        def __repr__(self) -> str:
+            return secret
+
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(AuditFilterError) as captured:
+        await ledger.list(cast(Any, InvalidFilter()))
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_filter_malformed_serialization_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    value = AuditFilter().to_dict(_safe_policy())
+    value["has_target"] = secret
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditFilter.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_snapshot_consistency_error_omits_secret() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    snapshot = _populated_snapshot(filtered=True)
+    secret_entry = _ledger_entry(
+        ledger_id=snapshot.status.ledger_id,
+        record=replace(_record(), summary=secret),
+    )
+    with pytest.raises(AuditSnapshotError) as captured:
+        replace(snapshot, entries=(secret_entry,), matching_entry_count=0)
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)
     assert secret not in str(captured.value.to_dict())

@@ -23,12 +23,14 @@ from typing import Protocol, Self, cast
 
 from alios_core.errors import (
     AuditContextError,
+    AuditFilterError,
     AuditIntegrityError,
     AuditLedgerCapacityError,
     AuditLedgerClosedError,
     AuditLedgerError,
     AuditLedgerVerificationError,
     AuditSerializationError,
+    AuditSnapshotError,
     AuditValidationError,
     ResourceConflictError,
     ResourceNotFoundError,
@@ -1139,6 +1141,611 @@ class AuditLedgerStatus:
             ) from error
 
 
+def _filter_collection(
+    value: object,
+    field_name: str,
+    item_type: type[object],
+    normalize: Callable[[object], object] | None = None,
+) -> frozenset[object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (frozenset, set, list, tuple)):
+        raise AuditFilterError(
+            "Invalid audit filter collection", details={"field_name": field_name}
+        )
+    normalized: list[object] = []
+    for item in value:
+        if type(item) is not item_type:
+            raise AuditFilterError(
+                "Invalid audit filter collection item", details={"field_name": field_name}
+            )
+        try:
+            normalized.append(normalize(item) if normalize is not None else item)
+        except (AuditValidationError, AuditSerializationError) as error:
+            raise AuditFilterError(
+                "Invalid audit filter collection item",
+                details={"field_name": field_name},
+                cause=error,
+            ) from error
+    result = frozenset(normalized)
+    if isinstance(value, (list, tuple)) and len(result) != len(value):
+        raise AuditFilterError(
+            "Duplicate audit filter collection item", details={"field_name": field_name}
+        )
+    return result or None
+
+
+def _filter_text(value: object, field_name: str, maximum: int, *, structural: bool = False) -> str:
+    try:
+        normalized = (
+            _token(value, field_name, maximum) if structural else _human(value, field_name, maximum)
+        )
+    except AuditValidationError as error:
+        raise AuditFilterError(
+            "Invalid audit filter text", details={"field_name": field_name}, cause=error
+        ) from error
+    if normalized is None:
+        raise AuditFilterError("Invalid audit filter text", details={"field_name": field_name})
+    return normalized
+
+
+def _filter_data(value: object, field_name: str) -> Mapping[str, object]:
+    try:
+        return _data(value, field_name)
+    except (AuditValidationError, AuditSerializationError) as error:
+        raise AuditFilterError(
+            "Invalid audit filter attributes", details={"field_name": field_name}, cause=error
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFilter:
+    sequences: frozenset[int] | None = None
+    record_ids: frozenset[AuditRecordId] | None = None
+    categories: frozenset[AuditCategory] | None = None
+    severities: frozenset[AuditSeverity] | None = None
+    outcomes: frozenset[AuditOutcome] | None = None
+    actor_kinds: frozenset[AuditActorKind] | None = None
+    actor_identifiers: frozenset[str] | None = None
+    actor_tenant_ids: frozenset[TenantId] | None = None
+    actor_user_ids: frozenset[UserId] | None = None
+    action_names: frozenset[str] | None = None
+    source_components: frozenset[str] | None = None
+    source_modules: frozenset[str] | None = None
+    source_operations: frozenset[str] | None = None
+    target_kinds: frozenset[str] | None = None
+    target_identifiers: frozenset[str] | None = None
+    has_target: bool | None = None
+    correlation_ids: frozenset[CorrelationId] | None = None
+    run_ids: frozenset[RunId] | None = None
+    tenant_ids: frozenset[TenantId] | None = None
+    user_ids: frozenset[UserId] | None = None
+    trace_ids: frozenset[TraceId] | None = None
+    span_ids: frozenset[SpanId] | None = None
+    parent_span_ids: frozenset[SpanId] | None = None
+    reason_codes: frozenset[str] | None = None
+    tags_all: frozenset[str] | None = None
+    tags_any: frozenset[str] | None = None
+    record_attribute_equals: Mapping[str, object] = field(default_factory=dict)
+    actor_attribute_equals: Mapping[str, object] = field(default_factory=dict)
+    action_attribute_equals: Mapping[str, object] = field(default_factory=dict)
+    target_attribute_equals: Mapping[str, object] = field(default_factory=dict)
+    context_metadata_equals: Mapping[str, object] = field(default_factory=dict)
+    occurred_after: datetime | None = None
+    occurred_before: datetime | None = None
+    appended_after: datetime | None = None
+    appended_before: datetime | None = None
+    minimum_sequence: int | None = None
+    maximum_sequence: int | None = None
+    limit: int | None = None
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        collection_types: tuple[tuple[str, type[object]], ...] = (
+            ("sequences", int),
+            ("record_ids", AuditRecordId),
+            ("categories", AuditCategory),
+            ("severities", AuditSeverity),
+            ("outcomes", AuditOutcome),
+            ("actor_kinds", AuditActorKind),
+            ("actor_tenant_ids", TenantId),
+            ("actor_user_ids", UserId),
+            ("correlation_ids", CorrelationId),
+            ("run_ids", RunId),
+            ("tenant_ids", TenantId),
+            ("user_ids", UserId),
+            ("trace_ids", TraceId),
+            ("span_ids", SpanId),
+            ("parent_span_ids", SpanId),
+        )
+        for name, kind in collection_types:
+            normalize: Callable[[object], object] | None = None
+            if name == "sequences":
+                normalize = _normalize_filter_sequence
+            object.__setattr__(
+                self,
+                name,
+                _filter_collection(getattr(self, name), name, kind, normalize),
+            )
+        text_rules: tuple[tuple[str, int, bool], ...] = (
+            ("actor_identifiers", 512, False),
+            ("action_names", 256, True),
+            ("source_components", 256, False),
+            ("source_modules", 256, False),
+            ("source_operations", 256, False),
+            ("target_kinds", 256, True),
+            ("target_identifiers", 512, False),
+            ("reason_codes", 128, True),
+            ("tags_all", 128, True),
+            ("tags_any", 128, True),
+        )
+        for name, maximum, structural in text_rules:
+
+            def normalize_text(
+                item: object,
+                field_name: str = name,
+                field_maximum: int = maximum,
+                field_structural: bool = structural,
+            ) -> object:
+                return _filter_text(item, field_name, field_maximum, structural=field_structural)
+
+            object.__setattr__(
+                self,
+                name,
+                _filter_collection(
+                    getattr(self, name),
+                    name,
+                    str,
+                    normalize_text,
+                ),
+            )
+        if self.has_target is not None and type(self.has_target) is not bool:
+            raise AuditFilterError(
+                "Invalid audit filter flag", details={"field_name": "has_target"}
+            )
+        for name in (
+            "record_attribute_equals",
+            "actor_attribute_equals",
+            "action_attribute_equals",
+            "target_attribute_equals",
+            "context_metadata_equals",
+        ):
+            object.__setattr__(self, name, _filter_data(getattr(self, name), name))
+        for name in ("occurred_after", "occurred_before", "appended_after", "appended_before"):
+            value = getattr(self, name)
+            if value is not None:
+                try:
+                    _aware(value, name)
+                except AuditValidationError as error:
+                    raise AuditFilterError(
+                        "Invalid audit filter time", details={"field_name": name}, cause=error
+                    ) from error
+        if (
+            self.occurred_after is not None
+            and self.occurred_before is not None
+            and self.occurred_after >= self.occurred_before
+        ):
+            raise AuditFilterError("Invalid audit filter occurred range")
+        if (
+            self.appended_after is not None
+            and self.appended_before is not None
+            and self.appended_after >= self.appended_before
+        ):
+            raise AuditFilterError("Invalid audit filter appended range")
+        for name in ("minimum_sequence", "maximum_sequence"):
+            value = getattr(self, name)
+            if value is not None:
+                _positive_filter_integer(value, name)
+        if (
+            self.minimum_sequence is not None
+            and self.maximum_sequence is not None
+            and self.minimum_sequence > self.maximum_sequence
+        ):
+            raise AuditFilterError("Invalid audit filter sequence range")
+        if self.limit is not None:
+            _nonnegative_filter_integer(self.limit, "limit")
+        _nonnegative_filter_integer(self.offset, "offset")
+
+    def matches(self, entry: AuditLedgerEntry) -> bool:
+        if type(entry) is not AuditLedgerEntry:
+            raise AuditFilterError("Invalid audit filter entry")
+        record, actor, source, context = (
+            entry.record,
+            entry.record.actor,
+            entry.record.source,
+            entry.record.context,
+        )
+        membership: tuple[tuple[object, frozenset[object] | None], ...] = (
+            (entry.sequence, cast(frozenset[object] | None, self.sequences)),
+            (record.record_id, cast(frozenset[object] | None, self.record_ids)),
+            (record.category, cast(frozenset[object] | None, self.categories)),
+            (record.severity, cast(frozenset[object] | None, self.severities)),
+            (record.outcome, cast(frozenset[object] | None, self.outcomes)),
+            (actor.kind, cast(frozenset[object] | None, self.actor_kinds)),
+            (actor.identifier, cast(frozenset[object] | None, self.actor_identifiers)),
+            (actor.tenant_id, cast(frozenset[object] | None, self.actor_tenant_ids)),
+            (actor.user_id, cast(frozenset[object] | None, self.actor_user_ids)),
+            (record.action.name, cast(frozenset[object] | None, self.action_names)),
+            (source.component, cast(frozenset[object] | None, self.source_components)),
+            (source.module, cast(frozenset[object] | None, self.source_modules)),
+            (source.operation, cast(frozenset[object] | None, self.source_operations)),
+            (
+                record.target.kind if record.target is not None else None,
+                cast(frozenset[object] | None, self.target_kinds),
+            ),
+            (
+                record.target.identifier if record.target is not None else None,
+                cast(frozenset[object] | None, self.target_identifiers),
+            ),
+            (context.correlation_id, cast(frozenset[object] | None, self.correlation_ids)),
+            (context.run_id, cast(frozenset[object] | None, self.run_ids)),
+            (context.tenant_id, cast(frozenset[object] | None, self.tenant_ids)),
+            (context.user_id, cast(frozenset[object] | None, self.user_ids)),
+            (context.trace_id, cast(frozenset[object] | None, self.trace_ids)),
+            (context.span_id, cast(frozenset[object] | None, self.span_ids)),
+            (context.parent_span_id, cast(frozenset[object] | None, self.parent_span_ids)),
+            (record.reason_code, cast(frozenset[object] | None, self.reason_codes)),
+        )
+        if any(values is not None and item not in values for item, values in membership):
+            return False
+        if self.has_target is not None and (record.target is not None) is not self.has_target:
+            return False
+        if self.tags_all is not None and not self.tags_all.issubset(record.tags):
+            return False
+        if self.tags_any is not None and self.tags_any.isdisjoint(record.tags):
+            return False
+        attributes: tuple[tuple[Mapping[str, object], Mapping[str, object]], ...] = (
+            (self.record_attribute_equals, record.attributes),
+            (self.actor_attribute_equals, actor.attributes),
+            (self.action_attribute_equals, record.action.attributes),
+            (
+                self.target_attribute_equals,
+                record.target.attributes if record.target is not None else {},
+            ),
+            (self.context_metadata_equals, context.metadata),
+        )
+        if self.target_attribute_equals and record.target is None:
+            return False
+        if any(
+            any(key not in actual or actual[key] != value for key, value in expected.items())
+            for expected, actual in attributes
+        ):
+            return False
+        if self.occurred_after is not None and record.occurred_at <= self.occurred_after:
+            return False
+        if self.occurred_before is not None and record.occurred_at >= self.occurred_before:
+            return False
+        if self.appended_after is not None and entry.appended_at <= self.appended_after:
+            return False
+        if self.appended_before is not None and entry.appended_at >= self.appended_before:
+            return False
+        if self.minimum_sequence is not None and entry.sequence < self.minimum_sequence:
+            return False
+        return self.maximum_sequence is None or entry.sequence <= self.maximum_sequence
+
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        policy = redaction_policy or default_redaction_policy()
+        result: dict[str, JsonValue] = {}
+        for name in ("sequences",):
+            value = getattr(self, name)
+            result[name] = cast(JsonValue, sorted(value)) if value is not None else None
+        for name in (
+            "record_ids",
+            "actor_tenant_ids",
+            "actor_user_ids",
+            "correlation_ids",
+            "run_ids",
+            "tenant_ids",
+            "user_ids",
+            "trace_ids",
+            "span_ids",
+            "parent_span_ids",
+        ):
+            value = getattr(self, name)
+            result[name] = cast(JsonValue, sorted(str(item) for item in value)) if value else None
+        for name in ("categories", "severities", "outcomes", "actor_kinds"):
+            value = getattr(self, name)
+            result[name] = cast(JsonValue, sorted(item.value for item in value)) if value else None
+        for name in (
+            "actor_identifiers",
+            "action_names",
+            "source_components",
+            "source_modules",
+            "source_operations",
+            "target_kinds",
+            "target_identifiers",
+            "reason_codes",
+            "tags_all",
+            "tags_any",
+        ):
+            value = getattr(self, name)
+            rendered = sorted(cast(frozenset[str], value)) if value else None
+            if rendered is not None and name in ("actor_identifiers", "target_identifiers"):
+                rendered = [cast(str, policy.redact(item)) for item in rendered]
+            result[name] = cast(JsonValue, rendered)
+        result["has_target"] = self.has_target
+        for name in (
+            "record_attribute_equals",
+            "actor_attribute_equals",
+            "action_attribute_equals",
+            "target_attribute_equals",
+            "context_metadata_equals",
+        ):
+            result[name] = _render(policy, cast(Mapping[str, object], getattr(self, name)))
+        for name in ("occurred_after", "occurred_before", "appended_after", "appended_before"):
+            value = cast(datetime | None, getattr(self, name))
+            result[name] = value.isoformat() if value is not None else None
+        for name in ("minimum_sequence", "maximum_sequence", "limit", "offset"):
+            result[name] = cast(int | None, getattr(self, name))
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+
+            def serialized_collection(name: str) -> list[object] | tuple[object, ...] | None:
+                item = value.get(name)
+                if item is not None and not isinstance(item, (list, tuple)):
+                    raise ValueError
+                return cast(list[object] | tuple[object, ...] | None, item)
+
+            def identifiers(name: str, kind: type[Identifier]) -> tuple[Identifier, ...] | None:
+                items = serialized_collection(name)
+                if items is None:
+                    return None
+                if any(not isinstance(item, str) for item in items):
+                    raise ValueError
+                return tuple(kind(cast(str, item)) for item in items)
+
+            def enums(name: str, kind: type[_AuditEnum]) -> tuple[_AuditEnum, ...] | None:
+                items = serialized_collection(name)
+                if items is None:
+                    return None
+                if any(not isinstance(item, str) for item in items):
+                    raise ValueError
+                return tuple(kind.parse(cast(str, item)) for item in items)
+
+            def texts(name: str) -> tuple[str, ...] | None:
+                items = serialized_collection(name)
+                if items is None:
+                    return None
+                if any(not isinstance(item, str) for item in items):
+                    raise ValueError
+                return tuple(cast(str, item) for item in items)
+
+            def instant(name: str) -> datetime | None:
+                item = value.get(name)
+                if item is None:
+                    return None
+                if not isinstance(item, str):
+                    raise ValueError
+                return datetime.fromisoformat(item)
+
+            sequences = serialized_collection("sequences")
+            if sequences is not None and any(type(item) is not int for item in sequences):
+                raise ValueError
+            has_target = value.get("has_target")
+            if has_target is not None and type(has_target) is not bool:
+                raise ValueError
+            integer_values: dict[str, int | None] = {}
+            for name in ("minimum_sequence", "maximum_sequence", "limit", "offset"):
+                item = value.get(name, 0 if name == "offset" else None)
+                if item is not None and type(item) is not int:
+                    raise ValueError
+                integer_values[name] = item
+            attribute_values: dict[str, Mapping[str, object]] = {}
+            for name in (
+                "record_attribute_equals",
+                "actor_attribute_equals",
+                "action_attribute_equals",
+                "target_attribute_equals",
+                "context_metadata_equals",
+            ):
+                item = value.get(name, {})
+                if not isinstance(item, Mapping):
+                    raise ValueError
+                attribute_values[name] = item
+            return cls(
+                sequences=cast(frozenset[int] | None, tuple(sequences) if sequences else None),
+                record_ids=cast(
+                    frozenset[AuditRecordId] | None, identifiers("record_ids", AuditRecordId)
+                ),
+                categories=cast(
+                    frozenset[AuditCategory] | None, enums("categories", AuditCategory)
+                ),
+                severities=cast(
+                    frozenset[AuditSeverity] | None, enums("severities", AuditSeverity)
+                ),
+                outcomes=cast(frozenset[AuditOutcome] | None, enums("outcomes", AuditOutcome)),
+                actor_kinds=cast(
+                    frozenset[AuditActorKind] | None, enums("actor_kinds", AuditActorKind)
+                ),
+                actor_identifiers=cast(frozenset[str] | None, texts("actor_identifiers")),
+                actor_tenant_ids=cast(
+                    frozenset[TenantId] | None, identifiers("actor_tenant_ids", TenantId)
+                ),
+                actor_user_ids=cast(
+                    frozenset[UserId] | None, identifiers("actor_user_ids", UserId)
+                ),
+                action_names=cast(frozenset[str] | None, texts("action_names")),
+                source_components=cast(frozenset[str] | None, texts("source_components")),
+                source_modules=cast(frozenset[str] | None, texts("source_modules")),
+                source_operations=cast(frozenset[str] | None, texts("source_operations")),
+                target_kinds=cast(frozenset[str] | None, texts("target_kinds")),
+                target_identifiers=cast(frozenset[str] | None, texts("target_identifiers")),
+                has_target=has_target,
+                correlation_ids=cast(
+                    frozenset[CorrelationId] | None, identifiers("correlation_ids", CorrelationId)
+                ),
+                run_ids=cast(frozenset[RunId] | None, identifiers("run_ids", RunId)),
+                tenant_ids=cast(frozenset[TenantId] | None, identifiers("tenant_ids", TenantId)),
+                user_ids=cast(frozenset[UserId] | None, identifiers("user_ids", UserId)),
+                trace_ids=cast(frozenset[TraceId] | None, identifiers("trace_ids", TraceId)),
+                span_ids=cast(frozenset[SpanId] | None, identifiers("span_ids", SpanId)),
+                parent_span_ids=cast(
+                    frozenset[SpanId] | None, identifiers("parent_span_ids", SpanId)
+                ),
+                reason_codes=cast(frozenset[str] | None, texts("reason_codes")),
+                tags_all=cast(frozenset[str] | None, texts("tags_all")),
+                tags_any=cast(frozenset[str] | None, texts("tags_any")),
+                record_attribute_equals=attribute_values["record_attribute_equals"],
+                actor_attribute_equals=attribute_values["actor_attribute_equals"],
+                action_attribute_equals=attribute_values["action_attribute_equals"],
+                target_attribute_equals=attribute_values["target_attribute_equals"],
+                context_metadata_equals=attribute_values["context_metadata_equals"],
+                occurred_after=instant("occurred_after"),
+                occurred_before=instant("occurred_before"),
+                appended_after=instant("appended_after"),
+                appended_before=instant("appended_before"),
+                minimum_sequence=integer_values["minimum_sequence"],
+                maximum_sequence=integer_values["maximum_sequence"],
+                limit=integer_values["limit"],
+                offset=cast(int, integer_values["offset"]),
+            )
+        except (
+            TypeError,
+            ValueError,
+            AuditValidationError,
+            AuditSerializationError,
+            AuditFilterError,
+        ) as error:
+            raise AuditSerializationError("Invalid serialized audit filter", cause=error) from error
+
+
+def _positive_filter_integer(value: object, field_name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise AuditFilterError("Invalid audit filter integer", details={"field_name": field_name})
+    return value
+
+
+def _normalize_filter_sequence(value: object) -> int:
+    return _positive_filter_integer(value, "sequences")
+
+
+def _nonnegative_filter_integer(value: object, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise AuditFilterError("Invalid audit filter integer", details={"field_name": field_name})
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLedgerSnapshot:
+    status: AuditLedgerStatus
+    entries: tuple[AuditLedgerEntry, ...]
+    collected_at: datetime
+    filtered: bool
+    matching_entry_count: int
+    verification: AuditLedgerVerificationResult
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not AuditLedgerStatus:
+            raise AuditSnapshotError("Invalid audit snapshot status")
+        if not isinstance(self.entries, tuple) or any(
+            type(item) is not AuditLedgerEntry for item in self.entries
+        ):
+            raise AuditSnapshotError("Invalid audit snapshot entries")
+        entries = tuple(self.entries)
+        object.__setattr__(self, "entries", entries)
+        sequences = [entry.sequence for entry in entries]
+        if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
+            raise AuditSnapshotError("Invalid audit snapshot entry order")
+        record_ids = [entry.record.record_id for entry in entries]
+        if len(record_ids) != len(set(record_ids)):
+            raise AuditSnapshotError("Duplicate audit snapshot record identifier")
+        if any(entry.ledger_id != self.status.ledger_id for entry in entries):
+            raise AuditSnapshotError("Audit snapshot ledger mismatch")
+        try:
+            collected = _aware(self.collected_at, "collected_at")
+        except AuditValidationError as error:
+            raise AuditSnapshotError(
+                "Invalid audit snapshot collection time",
+                details={"field_name": "collected_at"},
+                cause=error,
+            ) from error
+        if collected < self.status.created_at or (
+            self.status.last_appended_at is not None and collected < self.status.last_appended_at
+        ):
+            raise AuditSnapshotError("Audit snapshot collection time regressed")
+        if type(self.filtered) is not bool:
+            raise AuditSnapshotError("Invalid audit snapshot filtered flag")
+        if type(self.matching_entry_count) is not int or self.matching_entry_count < 0:
+            raise AuditSnapshotError("Invalid audit snapshot matching count")
+        if (
+            self.matching_entry_count > self.status.entry_count
+            or len(entries) > self.matching_entry_count
+        ):
+            raise AuditSnapshotError("Inconsistent audit snapshot matching count")
+        if not self.filtered and (
+            self.matching_entry_count != self.status.entry_count
+            or len(entries) != self.status.entry_count
+        ):
+            raise AuditSnapshotError("Inconsistent unfiltered audit snapshot")
+        if type(self.verification) is not AuditLedgerVerificationResult:
+            raise AuditSnapshotError("Invalid audit snapshot verification")
+        if self.verification.ledger_id != self.status.ledger_id:
+            raise AuditSnapshotError("Audit snapshot verification ledger mismatch")
+        if self.verification.valid and (
+            self.verification.checked_entry_count != self.status.entry_count
+            or self.verification.head_digest != self.status.head_digest
+        ):
+            raise AuditSnapshotError("Inconsistent audit snapshot verification")
+
+    def require_valid(self) -> None:
+        self.verification.require_valid()
+
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        return {
+            "status": self.status.to_dict(),
+            "entries": cast(JsonValue, [entry.to_dict(redaction_policy) for entry in self.entries]),
+            "collected_at": self.collected_at.isoformat(),
+            "filtered": self.filtered,
+            "matching_entry_count": self.matching_entry_count,
+            "verification": self.verification.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("status"), Mapping)
+                or not isinstance(value.get("entries"), (list, tuple))
+                or not all(
+                    isinstance(item, Mapping) for item in cast(list[object], value["entries"])
+                )
+                or not isinstance(value.get("collected_at"), str)
+                or type(value.get("filtered")) is not bool
+                or type(value.get("matching_entry_count")) is not int
+                or not isinstance(value.get("verification"), Mapping)
+            ):
+                raise ValueError
+            return cls(
+                AuditLedgerStatus.from_dict(cast(Mapping[str, object], value["status"])),
+                tuple(
+                    AuditLedgerEntry.from_dict(cast(Mapping[str, object], item))
+                    for item in cast(list[object] | tuple[object, ...], value["entries"])
+                ),
+                datetime.fromisoformat(cast(str, value["collected_at"])),
+                cast(bool, value["filtered"]),
+                cast(int, value["matching_entry_count"]),
+                AuditLedgerVerificationResult.from_dict(
+                    cast(Mapping[str, object], value["verification"])
+                ),
+            )
+        except (
+            TypeError,
+            ValueError,
+            AuditSerializationError,
+            AuditLedgerError,
+            AuditSnapshotError,
+        ) as error:
+            raise AuditSerializationError(
+                "Invalid serialized audit snapshot", cause=error
+            ) from error
+
+
 class AuditLedger(Protocol):
     async def append(self, record: AuditRecord) -> AuditLedgerEntry: ...
 
@@ -1153,6 +1760,12 @@ class AuditLedger(Protocol):
     ) -> AuditLedgerEntry | None: ...
 
     async def entries(self) -> tuple[AuditLedgerEntry, ...]: ...
+
+    async def list(self, filter: AuditFilter | None = None) -> tuple[AuditLedgerEntry, ...]: ...
+
+    async def count(self, filter: AuditFilter | None = None) -> int: ...
+
+    async def snapshot(self, filter: AuditFilter | None = None) -> AuditLedgerSnapshot: ...
 
     async def verify(self) -> AuditLedgerVerificationResult: ...
 
@@ -1280,6 +1893,57 @@ class InMemoryAuditLedger:
         async with self._lock:
             return tuple(self._entries)
 
+    async def list(self, filter: AuditFilter | None = None) -> tuple[AuditLedgerEntry, ...]:
+        _validate_filter(filter)
+        async with self._lock:
+            entries = tuple(self._entries)
+        matching = _matching_entries(entries, filter)
+        return _paginate_entries(matching, filter)
+
+    async def count(self, filter: AuditFilter | None = None) -> int:
+        _validate_filter(filter)
+        async with self._lock:
+            entries = tuple(self._entries)
+        return len(_matching_entries(entries, filter))
+
+    async def snapshot(self, filter: AuditFilter | None = None) -> AuditLedgerSnapshot:
+        _validate_filter(filter)
+        async with self._lock:
+            entries = tuple(self._entries)
+            status = AuditLedgerStatus(
+                self._ledger_id,
+                self._entry_count,
+                self._maximum_entries,
+                self._entry_count + 1,
+                self._head_digest,
+                self._closed,
+                self._created_at,
+                self._last_appended_at,
+            )
+            try:
+                collected_at = _aware(self._clock(), "collected_at")
+            except AuditValidationError as error:
+                raise AuditSnapshotError("Invalid audit snapshot clock", cause=error) from error
+            except Exception as error:
+                raise AuditSnapshotError("Audit snapshot clock failed") from error
+            if collected_at < self._created_at or (
+                self._last_appended_at is not None and collected_at < self._last_appended_at
+            ):
+                raise AuditSnapshotError("Audit snapshot clock regressed")
+            ledger_id = self._ledger_id
+            head_digest = self._head_digest
+            stored_count = self._entry_count
+        verification = _verify_chain(entries, ledger_id, head_digest, stored_count)
+        matching = _matching_entries(entries, filter)
+        return AuditLedgerSnapshot(
+            status,
+            _paginate_entries(matching, filter),
+            collected_at,
+            filter is not None,
+            len(matching),
+            verification,
+        )
+
     async def status(self) -> AuditLedgerStatus:
         async with self._lock:
             return AuditLedgerStatus(
@@ -1306,6 +1970,31 @@ class InMemoryAuditLedger:
             self._closed = True
 
 
+def _validate_filter(filter: AuditFilter | None) -> None:
+    if filter is not None and type(filter) is not AuditFilter:
+        raise AuditFilterError("Invalid audit ledger filter")
+
+
+def _matching_entries(
+    entries: tuple[AuditLedgerEntry, ...], filter: AuditFilter | None
+) -> tuple[AuditLedgerEntry, ...]:
+    ordered = tuple(sorted(entries, key=lambda entry: entry.sequence))
+    if filter is None:
+        return ordered
+    return tuple(entry for entry in ordered if filter.matches(entry))
+
+
+def _paginate_entries(
+    entries: tuple[AuditLedgerEntry, ...], filter: AuditFilter | None
+) -> tuple[AuditLedgerEntry, ...]:
+    if filter is None:
+        return entries
+    start = filter.offset
+    if filter.limit is None:
+        return entries[start:]
+    return entries[start : start + filter.limit]
+
+
 def _invalid_verification(
     ledger_id: AuditLedgerId,
     checked_count: int,
@@ -1314,13 +2003,18 @@ def _invalid_verification(
     entries: tuple[AuditLedgerEntry, ...],
     head_digest: str | None,
 ) -> AuditLedgerVerificationResult:
+    safe_head = (
+        head_digest
+        if isinstance(head_digest, str) and _LOWER_HEX.fullmatch(head_digest) is not None
+        else None
+    )
     return AuditLedgerVerificationResult(
         False,
         checked_count,
         ledger_id,
         entries[0].sequence if entries else None,
         entries[-1].sequence if entries else None,
-        head_digest,
+        safe_head,
         failure,
         sequence,
     )
@@ -1359,7 +2053,7 @@ def _verify_chain(
             if index == 1
             else AuditLedgerVerificationFailure.PREVIOUS_DIGEST_MISMATCH
         )
-        if entry.previous_digest != previous_digest:
+        if not _digest_equal(entry.previous_digest, previous_digest):
             return _invalid_verification(
                 ledger_id, index, expected_previous_failure, index, entries, head_digest
             )
@@ -1373,7 +2067,7 @@ def _verify_chain(
                 head_digest,
             )
         record_ids.add(entry.record.record_id)
-        if entry.record_digest != entry.record.integrity_digest():
+        if not _digest_equal(entry.record_digest, entry.record.integrity_digest()):
             return _invalid_verification(
                 ledger_id,
                 index,
@@ -1389,7 +2083,7 @@ def _verify_chain(
             entry.previous_digest,
             entry.appended_at,
         )
-        if entry.entry_digest != expected_entry_digest:
+        if not _digest_equal(entry.entry_digest, expected_entry_digest):
             return _invalid_verification(
                 ledger_id,
                 index,
@@ -1409,7 +2103,16 @@ def _verify_chain(
             )
         previous_digest = entry.entry_digest
         previous_time = entry.appended_at
-    if entries and head_digest != entries[-1].entry_digest:
+    if not entries and head_digest is not None:
+        return _invalid_verification(
+            ledger_id,
+            0,
+            AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH,
+            None,
+            entries,
+            head_digest,
+        )
+    if entries and not _digest_equal(head_digest, entries[-1].entry_digest):
         return _invalid_verification(
             ledger_id,
             len(entries),
@@ -1437,3 +2140,7 @@ def _verify_chain(
         len(entries),
         cast(str, head_digest),
     )
+
+
+def _digest_equal(left: object, right: object) -> bool:
+    return isinstance(left, str) and isinstance(right, str) and hmac.compare_digest(left, right)

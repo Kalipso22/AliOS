@@ -4,12 +4,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from alios_core import AuditRecordId, RunId
+from alios_core import AuditFilterError, AuditRecordId, RunId
 from alios_core.errors import (
     AuditContextError,
     AuditLedgerCapacityError,
     AuditLedgerClosedError,
     AuditLedgerError,
+    AuditLedgerVerificationError,
     AuditSerializationError,
     AuditValidationError,
     ResourceConflictError,
@@ -20,7 +21,9 @@ from alios_observability import (
     AuditActorKind,
     AuditCategory,
     AuditContext,
+    AuditFilter,
     AuditLedgerEntry,
+    AuditLedgerSnapshot,
     AuditLedgerVerificationFailure,
     AuditOutcome,
     AuditRecord,
@@ -722,7 +725,353 @@ def test_public_audit_ledger_exports_preserve_class_identity() -> None:
 @pytest.mark.asyncio
 async def test_audit_ledger_import_creates_no_global_tasks() -> None:
     before = asyncio.all_tasks()
-    import alios_observability.audit  # noqa: F401
+    import alios_observability.audit as audit
 
     await asyncio.sleep(0)
     assert asyncio.all_tasks() == before
+    assert not any(isinstance(value, InMemoryAuditLedger) for value in audit.__dict__.values())
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_category() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert len(await ledger.list(AuditFilter(categories=frozenset({AuditCategory.SECURITY})))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_actor() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert len(await ledger.list(AuditFilter(actor_identifiers=frozenset({"user"})))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_action() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count(AuditFilter(action_names=frozenset({"read"}))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_target() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), target=AuditTarget("document", "doc-1")))
+    assert len(await ledger.list(AuditFilter(target_kinds=frozenset({"document"})))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_context() -> None:
+    run_id = RunId()
+    trace = TraceContext.create_root(run_id=run_id)
+    context = AuditContext.from_trace_context(trace)
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), context=context))
+    assert await ledger.count(AuditFilter(run_ids=frozenset({run_id}))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_tags() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), tags=frozenset({"security", "access"})))
+    assert await ledger.count(AuditFilter(tags_all=frozenset({"security"}))) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_attributes() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), attributes={"region": "eu", "active": True}))
+    assert await ledger.count(AuditFilter(record_attribute_equals={"region": "eu"})) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_times() -> None:
+    instant = datetime(2026, 1, 2, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: instant)
+    await ledger.append(_record())
+    filter = AuditFilter(
+        appended_after=instant - timedelta(seconds=1),
+        appended_before=instant + timedelta(seconds=1),
+    )
+    assert await ledger.count(filter) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_filters_end_to_end_by_sequence_range() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    result = await ledger.list(AuditFilter(minimum_sequence=2, maximum_sequence=2))
+    assert tuple(entry.sequence for entry in result) == (2,)
+
+
+@pytest.mark.asyncio
+async def test_audit_query_combined_predicates() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), tags=frozenset({"security"}), attributes={"x": 1}))
+    filter = AuditFilter(
+        categories=frozenset({AuditCategory.SECURITY}),
+        actor_identifiers=frozenset({"user"}),
+        tags_any=frozenset({"security"}),
+        record_attribute_equals={"x": 1},
+    )
+    assert await ledger.count(filter) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_pagination_is_deterministic() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    for _ in "abc":
+        await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert tuple(entry.sequence for entry in await ledger.list(AuditFilter(offset=1, limit=1))) == (
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_query_count_ignores_pagination() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.count(AuditFilter(offset=10, limit=0)) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_preserves_append_order_not_occurrence_order() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    later = replace(_record(), occurred_at=datetime(2027, 1, 1, tzinfo=UTC))
+    earlier = replace(
+        _record(), record_id=AuditRecordId(), occurred_at=datetime(2025, 1, 1, tzinfo=UTC)
+    )
+    await ledger.append(later)
+    await ledger.append(earlier)
+    assert tuple(entry.record for entry in await ledger.list()) == (later, earlier)
+
+
+@pytest.mark.asyncio
+async def test_audit_query_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.close()
+    assert len(await ledger.list()) == await ledger.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_query_during_concurrent_appends_is_consistent() -> None:
+    ledger, gate = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), asyncio.Event()
+
+    async def append() -> None:
+        await gate.wait()
+        await ledger.append(_record())
+
+    task = asyncio.create_task(append())
+    before = await ledger.list()
+    gate.set()
+    await task
+    after = await ledger.list()
+    assert before == () and len(after) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_audit_ledgers_query_independently() -> None:
+    first = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    second = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await first.append(_record())
+    assert await first.count() == 1 and await second.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_complete_chain() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot()
+    assert snapshot.verification.valid and len(snapshot.entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_filtered_entries() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot(AuditFilter(categories=frozenset({AuditCategory.SYSTEM})))
+    assert snapshot.filtered and snapshot.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_paginated_entries() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert tuple(
+        entry.sequence for entry in (await ledger.snapshot(AuditFilter(offset=1))).entries
+    ) == (2,)
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_matching_count_before_pagination() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot(AuditFilter(limit=0))
+    assert snapshot.matching_entry_count == 1 and snapshot.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_round_trip_without_redaction() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot()
+    assert (
+        AuditLedgerSnapshot.from_dict(
+            snapshot.to_dict(RedactionPolicy(include_default_rules=False))
+        )
+        == snapshot
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_default_rendering_redacts_sensitive_records() -> None:
+    secret = "password=AUDIT-C2B2-QUERY-SECRET-913acf"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(replace(_record(), attributes={"password": secret}))
+    assert secret not in str((await ledger.snapshot()).to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_old_instance_unchanged_after_append() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    old = await ledger.snapshot()
+    await ledger.append(_record())
+    assert old.status.entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_after_close_preserves_closed_status() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    assert (await ledger.snapshot()).status.closed
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_uses_one_point_in_time_state() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot()
+    assert (
+        snapshot.status.entry_count
+        == len(snapshot.entries)
+        == snapshot.verification.checked_entry_count
+    )
+
+
+@pytest.mark.asyncio
+async def test_filtered_audit_snapshot_verifies_full_chain() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    snapshot = await ledger.snapshot(AuditFilter(limit=0))
+    assert snapshot.entries == () and snapshot.verification.checked_entry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_filtered_audit_snapshot_detects_corruption_before_selection() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    await ledger.append(
+        replace(_record(), record_id=AuditRecordId(), category=AuditCategory.SYSTEM)
+    )
+    object.__setattr__(first, "entry_digest", "1" * 64)
+    snapshot = await ledger.snapshot(AuditFilter(categories=frozenset({AuditCategory.SYSTEM})))
+    assert not snapshot.verification.valid and len(snapshot.entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_filtered_audit_snapshot_detects_corruption_after_selection() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    second = await ledger.append(
+        replace(_record(), record_id=AuditRecordId(), category=AuditCategory.SYSTEM)
+    )
+    object.__setattr__(second, "record_digest", "1" * 64)
+    snapshot = await ledger.snapshot(AuditFilter(categories=frozenset({AuditCategory.SECURITY})))
+    assert not snapshot.verification.valid and snapshot.entries[0].sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_filtered_audit_snapshot_does_not_rewrite_previous_digest() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    snapshot = await ledger.snapshot(AuditFilter(minimum_sequence=2))
+    assert snapshot.entries[0].previous_digest == first.entry_digest
+
+
+@pytest.mark.asyncio
+async def test_filtered_audit_snapshot_does_not_claim_subset_genesis() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    snapshot = await ledger.snapshot(AuditFilter(sequences=frozenset({2})))
+    assert snapshot.entries[0].previous_digest != "0" * 64
+    assert snapshot.entries[0].previous_digest == first.entry_digest
+
+
+@pytest.mark.asyncio
+async def test_audit_snapshot_require_valid_reports_safe_failure() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(replace(_record(), summary=secret))
+    object.__setattr__(entry, "entry_digest", "1" * 64)
+    snapshot = await ledger.snapshot()
+    with pytest.raises(AuditLedgerVerificationError) as captured:
+        snapshot.require_valid()
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_empty_ledger_head_corruption_detected() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    ledger._head_digest = "1" * 64
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_empty_ledger_count_corruption_detected() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    ledger._entry_count = 1
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.ENTRY_COUNT_MISMATCH
+
+
+def test_audit_query_errors_do_not_expose_secret_values() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    with pytest.raises(AuditFilterError) as captured:
+        AuditFilter(record_attribute_equals={"nested": [object(), secret]})
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_snapshot_errors_do_not_expose_secret_values() -> None:
+    secret = "AUDIT-C2B2-QUERY-SECRET-913acf"
+    value: dict[str, object] = {"secret": secret}
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditLedgerSnapshot.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_public_audit_query_exports_preserve_class_identity() -> None:
+    import alios_observability
+    import alios_observability.audit as audit
+
+    assert alios_observability.AuditFilter is audit.AuditFilter
+    assert alios_observability.AuditLedgerSnapshot is audit.AuditLedgerSnapshot
+
+
+@pytest.mark.asyncio
+async def test_audit_query_import_creates_no_global_tasks() -> None:
+    before = asyncio.all_tasks()
+    import alios_observability.audit as audit
+
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() == before
+    assert not any(
+        isinstance(value, (AuditFilter, AuditLedgerSnapshot)) for value in audit.__dict__.values()
+    )
