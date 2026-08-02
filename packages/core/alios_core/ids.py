@@ -101,6 +101,10 @@ class AuditRecordId(Identifier):
     pass
 
 
+class AuditLedgerId(Identifier):
+    pass
+
+
 class TraceId(Identifier):
     pass
 

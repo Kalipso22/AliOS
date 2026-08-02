@@ -15,6 +15,10 @@ from .errors import (
     AuditContextError,
     AuditError,
     AuditIntegrityError,
+    AuditLedgerCapacityError,
+    AuditLedgerClosedError,
+    AuditLedgerError,
+    AuditLedgerVerificationError,
     AuditSerializationError,
     AuditValidationError,
     SamplingError,
@@ -29,7 +33,7 @@ from .errors import (
     TracerClosedError,
 )
 from .events import AsyncEventBus, BaseEvent, DispatchMode, Event, EventBus, PolicyEvaluated
-from .ids import AuditRecordId, CorrelationId, LogRecordId, RunId, SpanId, TraceId
+from .ids import AuditLedgerId, AuditRecordId, CorrelationId, LogRecordId, RunId, SpanId, TraceId
 from .lifecycle import LifecycleHealth, LifecycleManager, LifecycleState, ManagedLifecycleComponent
 from .policy import (
     InMemoryPolicyEvaluator,
@@ -48,6 +52,11 @@ __all__ = [
     "AuditContextError",
     "AuditError",
     "AuditIntegrityError",
+    "AuditLedgerCapacityError",
+    "AuditLedgerClosedError",
+    "AuditLedgerError",
+    "AuditLedgerId",
+    "AuditLedgerVerificationError",
     "AuditRecordId",
     "AuditSerializationError",
     "AuditValidationError",

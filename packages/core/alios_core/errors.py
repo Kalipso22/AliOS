@@ -148,6 +148,22 @@ class AuditIntegrityError(AuditError):
     code = "audit_integrity_error"
 
 
+class AuditLedgerError(AuditError):
+    code = "audit_ledger_error"
+
+
+class AuditLedgerClosedError(AuditLedgerError):
+    code = "audit_ledger_closed"
+
+
+class AuditLedgerCapacityError(AuditLedgerError):
+    code = "audit_ledger_capacity"
+
+
+class AuditLedgerVerificationError(AuditIntegrityError):
+    code = "audit_ledger_verification_error"
+
+
 class TracingError(ObservabilityError):
     code = "tracing_error"
 

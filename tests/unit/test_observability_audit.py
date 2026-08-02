@@ -8,13 +8,27 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from alios_core import AuditRecordId, CorrelationId, LogRecordId, RunId, SpanId, TraceId
+from alios_core import (
+    AuditLedgerCapacityError,
+    AuditLedgerClosedError,
+    AuditLedgerError,
+    AuditLedgerId,
+    AuditLedgerVerificationError,
+    AuditRecordId,
+    CorrelationId,
+    LogRecordId,
+    RunId,
+    SpanId,
+    TraceId,
+)
 from alios_core.errors import (
     AuditContextError,
     AuditError,
     AuditIntegrityError,
     AuditSerializationError,
     AuditValidationError,
+    ResourceConflictError,
+    ResourceNotFoundError,
 )
 from alios_core.ids import EventId, TenantId, UserId
 from alios_observability import (
@@ -23,10 +37,15 @@ from alios_observability import (
     AuditActorKind,
     AuditCategory,
     AuditContext,
+    AuditLedgerEntry,
+    AuditLedgerStatus,
+    AuditLedgerVerificationFailure,
+    AuditLedgerVerificationResult,
     AuditOutcome,
     AuditRecord,
     AuditSeverity,
     AuditTarget,
+    InMemoryAuditLedger,
     RedactionPolicy,
     TraceContext,
     TraceSource,
@@ -77,6 +96,43 @@ def _created_record(**overrides: Any) -> AuditRecord:
 
 def _safe_policy() -> RedactionPolicy:
     return RedactionPolicy(include_default_rules=False)
+
+
+def _ledger_entry(
+    *,
+    ledger_id: AuditLedgerId | None = None,
+    record: AuditRecord | None = None,
+    sequence: int = 1,
+    appended_at: datetime | None = None,
+    previous_digest: str = "0" * 64,
+) -> AuditLedgerEntry:
+    return AuditLedgerEntry.create(
+        ledger_id=ledger_id or AuditLedgerId(),
+        sequence=sequence,
+        record=record or _record(),
+        appended_at=appended_at or datetime(2026, 1, 1, tzinfo=UTC),
+        previous_digest=previous_digest,
+    )
+
+
+class _LedgerClock:
+    def __init__(self, *values: datetime) -> None:
+        self.values = list(values)
+
+    def __call__(self) -> datetime:
+        return self.values.pop(0)
+
+
+def _secret_ledger_record() -> AuditRecord:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    return replace(
+        _record(),
+        actor=AuditActor(AuditActorKind.USER, secret),
+        target=AuditTarget("document", secret),
+        summary=secret,
+        context=AuditContext(metadata={"password": secret}),
+        attributes={"password": secret},
+    )
 
 
 def test_audit_record_id_generation() -> None:
@@ -1488,6 +1544,1051 @@ def test_audit_record_duplicate_tag_error_omits_values() -> None:
     value["tags"] = [secret, secret]
     with pytest.raises(AuditSerializationError) as captured:
         AuditRecord.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_ledger_id_generation() -> None:
+    assert AuditLedgerId().value.version == 4
+
+
+def test_audit_ledger_id_string_round_trip() -> None:
+    identifier = AuditLedgerId()
+    assert AuditLedgerId(str(identifier)) == identifier
+
+
+def test_audit_ledger_id_type_sensitive_equality() -> None:
+    identifier = AuditLedgerId()
+    assert identifier != TraceId(identifier.value)
+
+
+def test_audit_ledger_id_does_not_equal_record_id() -> None:
+    identifier = AuditLedgerId()
+    assert identifier != AuditRecordId(identifier.value)
+
+
+def test_audit_ledger_id_rejects_non_v4_uuid() -> None:
+    with pytest.raises(ValueError):
+        AuditLedgerId(UUID(int=0))
+
+
+def test_audit_ledger_id_is_hashable() -> None:
+    identifier = AuditLedgerId()
+    assert identifier in {identifier}
+
+
+def test_audit_ledger_id_uuid_and_json_conversion() -> None:
+    value = uuid4()
+    identifier = AuditLedgerId(value)
+    assert identifier.value == value and identifier.to_json() == str(value)
+
+
+def test_audit_ledger_id_does_not_equal_other_identifier_types() -> None:
+    identifier = AuditLedgerId()
+    assert identifier != EventId(identifier.value)
+    assert identifier != SpanId(identifier.value)
+    assert identifier != CorrelationId(identifier.value)
+
+
+def test_audit_ledger_error_codes_are_stable() -> None:
+    assert (
+        AuditLedgerError.code,
+        AuditLedgerClosedError.code,
+        AuditLedgerCapacityError.code,
+        AuditLedgerVerificationError.code,
+    ) == (
+        "audit_ledger_error",
+        "audit_ledger_closed",
+        "audit_ledger_capacity",
+        "audit_ledger_verification_error",
+    )
+
+
+def test_audit_ledger_error_details_are_safe() -> None:
+    error = AuditLedgerError("safe", details={"sequence": 1})
+    assert error.to_dict()["details"] == {"sequence": 1}
+
+
+def test_audit_ledger_digest_accepts_lowercase_sha256() -> None:
+    assert _ledger_entry().entry_digest.islower() and len(_ledger_entry().entry_digest) == 64
+
+
+def test_audit_ledger_digest_rejects_uppercase() -> None:
+    entry = _ledger_entry()
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(entry, entry_digest=entry.entry_digest.upper())
+
+
+def test_audit_ledger_digest_rejects_wrong_length() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), record_digest="0" * 63)
+
+
+def test_audit_ledger_digest_rejects_non_hex() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), previous_digest="g" * 64)
+
+
+def test_audit_ledger_digest_rejects_non_string() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), entry_digest=cast(Any, b"0" * 64))
+
+
+def test_audit_ledger_digest_rejects_whitespace() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), record_digest=" " + "0" * 63)
+
+
+def test_audit_ledger_digest_rejects_prefix() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), previous_digest="0x" + "0" * 62)
+
+
+def test_audit_ledger_entry_digest_is_deterministic() -> None:
+    ledger_id, record = AuditLedgerId(), _record()
+    assert _ledger_entry(ledger_id=ledger_id, record=record) == _ledger_entry(
+        ledger_id=ledger_id, record=record
+    )
+
+
+def test_audit_ledger_entry_digest_normalizes_datetime_to_utc() -> None:
+    ledger_id, record = AuditLedgerId(), _record()
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    shifted = instant.astimezone(timezone(timedelta(hours=3)))
+    assert (
+        _ledger_entry(ledger_id=ledger_id, record=record, appended_at=instant).entry_digest
+        == _ledger_entry(ledger_id=ledger_id, record=record, appended_at=shifted).entry_digest
+    )
+
+
+def test_audit_ledger_entry_digest_changes_with_ledger_id() -> None:
+    record = _record()
+    assert _ledger_entry(record=record).entry_digest != _ledger_entry(record=record).entry_digest
+
+
+def test_audit_ledger_entry_digest_changes_with_sequence() -> None:
+    first = _ledger_entry()
+    second = _ledger_entry(
+        ledger_id=first.ledger_id,
+        record=first.record,
+        sequence=2,
+        previous_digest=first.previous_digest,
+    )
+    assert first.entry_digest != second.entry_digest
+
+
+def test_audit_ledger_entry_digest_changes_with_record_digest() -> None:
+    ledger_id = AuditLedgerId()
+    assert (
+        _ledger_entry(ledger_id=ledger_id).entry_digest
+        != _ledger_entry(
+            ledger_id=ledger_id, record=replace(_record(), record_id=AuditRecordId())
+        ).entry_digest
+    )
+
+
+def test_audit_ledger_entry_digest_changes_with_previous_digest() -> None:
+    first = _ledger_entry()
+    second = _ledger_entry(
+        ledger_id=first.ledger_id,
+        record=first.record,
+        sequence=2,
+        previous_digest="1" * 64,
+    )
+    assert first.entry_digest != second.entry_digest
+
+
+def test_audit_ledger_entry_digest_changes_with_appended_time() -> None:
+    ledger_id, record = AuditLedgerId(), _record()
+    assert (
+        _ledger_entry(ledger_id=ledger_id, record=record).entry_digest
+        != _ledger_entry(
+            ledger_id=ledger_id,
+            record=record,
+            appended_at=datetime(2026, 1, 2, tzinfo=UTC),
+        ).entry_digest
+    )
+
+
+def test_audit_ledger_entry_valid() -> None:
+    assert _ledger_entry().sequence == 1
+
+
+def test_audit_ledger_entry_factory() -> None:
+    entry = _ledger_entry()
+    assert entry.record_digest == entry.record.integrity_digest()
+
+
+def test_audit_ledger_entry_requires_ledger_id() -> None:
+    with pytest.raises(AuditLedgerError):
+        replace(_ledger_entry(), ledger_id=cast(Any, AuditRecordId()))
+
+
+def test_audit_ledger_entry_rejects_boolean_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        replace(_ledger_entry(), sequence=True)
+
+
+def test_audit_ledger_entry_rejects_zero_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        replace(_ledger_entry(), sequence=0)
+
+
+def test_audit_ledger_entry_requires_record() -> None:
+    with pytest.raises(AuditLedgerError):
+        replace(_ledger_entry(), record=cast(Any, object()))
+
+
+def test_audit_ledger_entry_rejects_naive_append_time() -> None:
+    with pytest.raises(AuditLedgerError):
+        _ledger_entry(appended_at=datetime(2026, 1, 1))
+
+
+def test_audit_ledger_entry_first_requires_genesis_digest() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        _ledger_entry(previous_digest="1" * 64)
+
+
+def test_audit_ledger_entry_rejects_record_digest_mismatch() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), record_digest="1" * 64)
+
+
+def test_audit_ledger_entry_rejects_entry_digest_mismatch() -> None:
+    with pytest.raises(AuditLedgerVerificationError):
+        replace(_ledger_entry(), entry_digest="1" * 64)
+
+
+def test_audit_ledger_entry_is_immutable() -> None:
+    def mutate(entry: object) -> None:
+        delattr(entry, "sequence")
+
+    with pytest.raises(FrozenInstanceError):
+        mutate(_ledger_entry())
+
+
+def test_audit_ledger_entry_serialization() -> None:
+    assert set(_ledger_entry().to_dict(_safe_policy())) == {
+        "ledger_id",
+        "sequence",
+        "record",
+        "appended_at",
+        "previous_digest",
+        "record_digest",
+        "entry_digest",
+    }
+
+
+def test_audit_ledger_entry_round_trip_without_redaction() -> None:
+    entry = _ledger_entry()
+    assert AuditLedgerEntry.from_dict(entry.to_dict(_safe_policy())) == entry
+
+
+def test_audit_ledger_entry_serialization_is_independent() -> None:
+    entry = _ledger_entry(record=replace(_record(), attributes={"nested": [1]}))
+    rendered = entry.to_dict(_safe_policy())
+    cast(dict[str, object], cast(dict[str, object], rendered["record"])["attributes"])[
+        "nested"
+    ] = []
+    assert entry.record.attributes["nested"] == (1,)
+
+
+def test_audit_ledger_entry_rendering_redacts_record() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    rendered = _ledger_entry(record=replace(_record(), attributes={"password": secret})).to_dict()
+    assert secret not in str(rendered)
+
+
+def test_redacted_audit_ledger_entry_is_display_only() -> None:
+    entry = _ledger_entry(record=replace(_record(), attributes={"password": "secret"}))
+    with pytest.raises(AuditSerializationError):
+        AuditLedgerEntry.from_dict(entry.to_dict())
+
+
+def test_audit_ledger_entry_from_dict_uses_strict_types() -> None:
+    value = _ledger_entry().to_dict(_safe_policy())
+    value["sequence"] = True
+    with pytest.raises(AuditSerializationError):
+        AuditLedgerEntry.from_dict(value)
+
+
+def test_audit_ledger_verification_failure_exact_values() -> None:
+    assert [item.value for item in AuditLedgerVerificationFailure] == [
+        "ledger_id_mismatch",
+        "genesis_mismatch",
+        "sequence_mismatch",
+        "previous_digest_mismatch",
+        "record_digest_mismatch",
+        "entry_digest_mismatch",
+        "appended_time_regression",
+        "duplicate_record_id",
+        "head_digest_mismatch",
+        "entry_count_mismatch",
+    ]
+
+
+def test_audit_ledger_verification_failure_parsing() -> None:
+    assert (
+        AuditLedgerVerificationFailure.parse("genesis_mismatch")
+        is AuditLedgerVerificationFailure.GENESIS_MISMATCH
+    )
+
+
+def test_audit_ledger_verification_failure_rejects_unknown() -> None:
+    with pytest.raises(AuditValidationError):
+        AuditLedgerVerificationFailure.parse("unknown")
+
+
+def test_audit_ledger_verification_failure_rejects_non_string() -> None:
+    with pytest.raises(AuditValidationError):
+        AuditLedgerVerificationFailure.parse(cast(Any, 1))
+
+
+def test_audit_ledger_verification_result_empty_valid() -> None:
+    result = AuditLedgerVerificationResult(True, 0, AuditLedgerId(), None, None, None)
+    assert result.valid and result.checked_entry_count == 0
+
+
+def test_audit_ledger_verification_result_non_empty_valid() -> None:
+    result = AuditLedgerVerificationResult(True, 1, AuditLedgerId(), 1, 1, "1" * 64)
+    assert result.head_digest == "1" * 64
+
+
+def test_audit_ledger_verification_result_invalid() -> None:
+    result = AuditLedgerVerificationResult(
+        False,
+        1,
+        AuditLedgerId(),
+        1,
+        1,
+        "1" * 64,
+        AuditLedgerVerificationFailure.ENTRY_DIGEST_MISMATCH,
+        1,
+    )
+    assert not result.valid and result.failure_sequence == 1
+
+
+def test_audit_ledger_verification_result_rejects_invalid_consistency() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerVerificationResult(True, 1, AuditLedgerId(), 1, 1, None)
+
+
+def test_audit_ledger_verification_result_serialization() -> None:
+    result = AuditLedgerVerificationResult(True, 0, AuditLedgerId(), None, None, None)
+    assert result.to_dict()["failure"] is None
+
+
+def test_audit_ledger_verification_result_round_trip() -> None:
+    result = AuditLedgerVerificationResult(True, 1, AuditLedgerId(), 1, 1, "1" * 64)
+    assert AuditLedgerVerificationResult.from_dict(result.to_dict()) == result
+
+
+def test_audit_ledger_verification_result_require_valid() -> None:
+    result = AuditLedgerVerificationResult(True, 0, AuditLedgerId(), None, None, None)
+    result.require_valid()
+    assert result.valid
+
+
+def test_audit_ledger_verification_result_require_valid_raises() -> None:
+    result = AuditLedgerVerificationResult(
+        False,
+        0,
+        AuditLedgerId(),
+        None,
+        None,
+        None,
+        AuditLedgerVerificationFailure.ENTRY_COUNT_MISMATCH,
+    )
+    with pytest.raises(AuditLedgerVerificationError):
+        result.require_valid()
+
+
+def test_audit_ledger_status_empty() -> None:
+    status = AuditLedgerStatus(
+        AuditLedgerId(), 0, 10, 1, None, False, datetime(2026, 1, 1, tzinfo=UTC), None
+    )
+    assert status.entry_count == 0 and status.head_digest is None
+
+
+def test_audit_ledger_status_populated() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    status = AuditLedgerStatus(AuditLedgerId(), 1, 10, 2, "1" * 64, False, instant, instant)
+    assert status.next_sequence == 2
+
+
+def test_audit_ledger_status_rejects_boolean_count() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(
+            AuditLedgerId(), True, 10, 2, "1" * 64, False, datetime.now(UTC), datetime.now(UTC)
+        )
+
+
+def test_audit_ledger_status_rejects_count_over_capacity() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(
+            AuditLedgerId(), 2, 1, 3, "1" * 64, False, datetime.now(UTC), datetime.now(UTC)
+        )
+
+
+def test_audit_ledger_status_rejects_wrong_next_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(AuditLedgerId(), 0, 1, 2, None, False, datetime.now(UTC), None)
+
+
+def test_audit_ledger_status_rejects_empty_with_head() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(AuditLedgerId(), 0, 1, 1, "1" * 64, False, datetime.now(UTC), None)
+
+
+def test_audit_ledger_status_rejects_non_empty_without_head() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(
+            AuditLedgerId(), 1, 1, 2, None, False, datetime.now(UTC), datetime.now(UTC)
+        )
+
+
+def test_audit_ledger_status_rejects_naive_creation_time() -> None:
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(AuditLedgerId(), 0, 1, 1, None, False, datetime.now(), None)
+
+
+def test_audit_ledger_status_rejects_last_append_before_creation() -> None:
+    created = datetime(2026, 1, 2, tzinfo=UTC)
+    with pytest.raises(AuditLedgerError):
+        AuditLedgerStatus(
+            AuditLedgerId(),
+            1,
+            1,
+            2,
+            "1" * 64,
+            False,
+            created,
+            created - timedelta(seconds=1),
+        )
+
+
+def test_audit_ledger_status_serialization() -> None:
+    status = AuditLedgerStatus(
+        AuditLedgerId(), 0, 10, 1, None, False, datetime(2026, 1, 1, tzinfo=UTC), None
+    )
+    assert status.to_dict()["next_sequence"] == 1
+
+
+def test_audit_ledger_status_round_trip() -> None:
+    status = AuditLedgerStatus(
+        AuditLedgerId(), 0, 10, 1, None, False, datetime(2026, 1, 1, tzinfo=UTC), None
+    )
+    assert AuditLedgerStatus.from_dict(status.to_dict()) == status
+
+
+@pytest.mark.asyncio
+async def test_in_memory_audit_ledger_default_construction() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    assert (await ledger.status()).entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_in_memory_audit_ledger_explicit_id() -> None:
+    identifier = AuditLedgerId()
+    ledger = InMemoryAuditLedger(ledger_id=identifier, clock=lambda: datetime.now(UTC))
+    assert (await ledger.status()).ledger_id is identifier
+
+
+def test_in_memory_audit_ledger_rejects_wrong_id() -> None:
+    with pytest.raises(AuditLedgerError):
+        InMemoryAuditLedger(ledger_id=cast(Any, AuditRecordId()))
+
+
+def test_in_memory_audit_ledger_rejects_zero_capacity() -> None:
+    with pytest.raises(AuditLedgerError):
+        InMemoryAuditLedger(maximum_entries=0)
+
+
+def test_in_memory_audit_ledger_rejects_boolean_capacity() -> None:
+    with pytest.raises(AuditLedgerError):
+        InMemoryAuditLedger(maximum_entries=True)
+
+
+def test_in_memory_audit_ledger_rejects_excessive_capacity() -> None:
+    with pytest.raises(AuditLedgerCapacityError):
+        InMemoryAuditLedger(maximum_entries=1_000_001)
+
+
+def test_in_memory_audit_ledger_rejects_naive_constructor_clock() -> None:
+    with pytest.raises(AuditLedgerError):
+        InMemoryAuditLedger(clock=datetime.now)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_audit_ledgers_are_isolated() -> None:
+    first = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    second = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await first.append(_record())
+    assert await second.entries() == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_first_entry() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: instant)
+    entry = await ledger.append(_record())
+    assert entry.sequence == 1 and entry.previous_digest == "0" * 64
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_sequence_is_contiguous() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entries = (
+        await ledger.append(_record()),
+        await ledger.append(replace(_record(), record_id=AuditRecordId())),
+    )
+    assert tuple(item.sequence for item in entries) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_links_previous_digest() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    second = await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert second.previous_digest == first.entry_digest
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_preserves_record_identity() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    assert (await ledger.append(record)).record is record
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_allows_older_occurrence_time() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime(2026, 2, 1, tzinfo=UTC))
+    assert (await ledger.append(_record())).sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_allows_equal_append_time() -> None:
+    instant = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: instant)
+    await ledger.append(_record())
+    assert (
+        await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    ).appended_at == instant
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_rejects_backward_clock() -> None:
+    later, earlier = datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=_LedgerClock(later, earlier))
+    with pytest.raises(AuditLedgerError):
+        await ledger.append(_record())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_rejects_duplicate_record_id() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    await ledger.append(record)
+    with pytest.raises(ResourceConflictError):
+        await ledger.append(record)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_rejects_wrong_record_type() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(AuditLedgerError):
+        await ledger.append(cast(Any, object()))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_capacity_limit() -> None:
+    ledger = InMemoryAuditLedger(maximum_entries=1, clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    with pytest.raises(AuditLedgerCapacityError):
+        await ledger.append(replace(_record(), record_id=AuditRecordId()))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_failed_append_does_not_consume_sequence() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    record = _record()
+    await ledger.append(record)
+    with pytest.raises(ResourceConflictError):
+        await ledger.append(record)
+    assert (await ledger.append(replace(record, record_id=AuditRecordId()))).sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_failed_append_does_not_change_head() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    await ledger.append(record)
+    before = (await ledger.status()).head_digest
+    with pytest.raises(ResourceConflictError):
+        await ledger.append(record)
+    assert (await ledger.status()).head_digest == before
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_failed_append_does_not_change_status() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    await ledger.append(record)
+    before = await ledger.status()
+    with pytest.raises(ResourceConflictError):
+        await ledger.append(record)
+    assert await ledger.status() == before
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_concurrent_final_slot() -> None:
+    ledger = InMemoryAuditLedger(maximum_entries=1, clock=lambda: datetime.now(UTC))
+    results = await asyncio.gather(
+        ledger.append(_record()),
+        ledger.append(replace(_record(), record_id=AuditRecordId())),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(item, AuditLedgerEntry) for item in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_concurrent_duplicate_record_id() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    results = await asyncio.gather(
+        ledger.append(record), ledger.append(record), return_exceptions=True
+    )
+    assert sum(isinstance(item, ResourceConflictError) for item in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    assert await ledger.get(1) is entry
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_optional_existing() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    assert await ledger.get_optional(1) is entry
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_optional_missing() -> None:
+    assert await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).get_optional(1) is None
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_missing() -> None:
+    with pytest.raises(ResourceNotFoundError):
+        await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).get(1)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_rejects_boolean_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).get(True)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_rejects_zero_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).get(0)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_rejects_negative_sequence() -> None:
+    with pytest.raises(AuditLedgerError):
+        await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).get(-1)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_rejects_float_sequence() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(AuditLedgerError):
+        await ledger.get(cast(Any, 1.0))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_optional_rejects_numeric_string() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(AuditLedgerError):
+        await ledger.get_optional(cast(Any, "1"))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_by_record_id() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    entry = await ledger.append(record)
+    assert await ledger.get_by_record_id(record.record_id) is entry
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_optional_by_record_id_existing() -> None:
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _record()
+    entry = await ledger.append(record)
+    assert await ledger.get_optional_by_record_id(record.record_id) is entry
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_optional_by_record_id_missing() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    assert await ledger.get_optional_by_record_id(AuditRecordId()) is None
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_by_record_id_missing() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(ResourceNotFoundError):
+        await ledger.get_by_record_id(AuditRecordId())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_by_record_id_rejects_wrong_identifier() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    with pytest.raises(AuditLedgerError):
+        await ledger.get_by_record_id(cast(Any, AuditLedgerId()))
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_entries_empty() -> None:
+    assert await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).entries() == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_entries_sequence_order() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert tuple(item.sequence for item in await ledger.entries()) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_entries_returns_immutable_tuple() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert isinstance(await ledger.entries(), tuple)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_entries_snapshot_is_independent() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    snapshot = await ledger.entries()
+    await ledger.append(_record())
+    assert snapshot == ()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_empty() -> None:
+    result = await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).verify()
+    assert result.valid and result.checked_entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_single_entry() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert (await ledger.verify()).valid
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_multiple_entries() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    assert (await ledger.verify()).checked_entry_count == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_is_deterministic() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    assert await ledger.verify() == await ledger.verify()
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_ledger_id_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "ledger_id", AuditLedgerId())
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.LEDGER_ID_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_sequence_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "sequence", 2)
+    result = await ledger.verify()
+    assert result.failure is AuditLedgerVerificationFailure.SEQUENCE_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_genesis_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "previous_digest", "1" * 64)
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.GENESIS_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_previous_digest_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    second = await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    object.__setattr__(second, "previous_digest", "1" * 64)
+    result = await ledger.verify()
+    assert result.failure is AuditLedgerVerificationFailure.PREVIOUS_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_duplicate_record_id() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    first = await ledger.append(_record())
+    second = await ledger.append(replace(_record(), record_id=AuditRecordId()))
+    object.__setattr__(second, "record", first.record)
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.DUPLICATE_RECORD_ID
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_record_digest_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "record_digest", "1" * 64)
+    result = await ledger.verify()
+    assert result.failure is AuditLedgerVerificationFailure.RECORD_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_entry_digest_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    object.__setattr__(entry, "entry_digest", "1" * 64)
+    result = await ledger.verify()
+    assert result.failure is AuditLedgerVerificationFailure.ENTRY_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_append_time_regression() -> None:
+    created = datetime(2026, 1, 2, tzinfo=UTC)
+    ledger = InMemoryAuditLedger(clock=lambda: created)
+    first = await ledger.append(_record())
+    second_record = replace(_record(), record_id=AuditRecordId())
+    second = AuditLedgerEntry.create(
+        ledger_id=first.ledger_id,
+        sequence=2,
+        record=second_record,
+        appended_at=created - timedelta(seconds=1),
+        previous_digest=first.entry_digest,
+    )
+    ledger._entries.append(second)
+    ledger._entry_count = 2
+    ledger._head_digest = second.entry_digest
+    assert (
+        await ledger.verify()
+    ).failure is AuditLedgerVerificationFailure.APPENDED_TIME_REGRESSION
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_head_digest_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    ledger._head_digest = "1" * 64
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_detects_entry_count_mismatch() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    ledger._entry_count = 2
+    assert (await ledger.verify()).failure is AuditLedgerVerificationFailure.ENTRY_COUNT_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verification_error_omits_record_values() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(replace(_record(), summary=secret))
+    object.__setattr__(entry, "entry_digest", "1" * 64)
+    result = await ledger.verify()
+    with pytest.raises(AuditLedgerVerificationError) as captured:
+        result.require_valid()
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_initial_status() -> None:
+    status = await InMemoryAuditLedger(clock=lambda: datetime.now(UTC)).status()
+    assert status.next_sequence == 1 and not status.closed
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_status_after_append() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    status = await ledger.status()
+    assert status.entry_count == 1 and status.head_digest == entry.entry_digest
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_old_status_unchanged_after_append() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    old = await ledger.status()
+    await ledger.append(_record())
+    assert old.entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    assert (await ledger.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_repeated_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    await ledger.close()
+    assert (await ledger.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_append_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    with pytest.raises(AuditLedgerClosedError):
+        await ledger.append(_record())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_get_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    entry = await ledger.append(_record())
+    await ledger.close()
+    assert await ledger.get(1) is entry
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_entries_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.close()
+    assert len(await ledger.entries()) == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_verify_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    assert (await ledger.verify()).valid
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_status_after_close() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    before = await ledger.status()
+    await ledger.close()
+    after = await ledger.status()
+    assert after.closed and after.created_at == before.created_at
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_close_does_not_clear_entries() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    await ledger.close()
+    assert (await ledger.status()).entry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_concurrent_append_and_close_is_consistent() -> None:
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    results = await asyncio.gather(ledger.append(_record()), ledger.close(), return_exceptions=True)
+    assert (await ledger.status()).closed and len(await ledger.entries()) in (0, 1)
+    assert not any(isinstance(item, BaseException) for item in results)
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_duplicate_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger, record = InMemoryAuditLedger(clock=lambda: datetime.now(UTC)), _secret_ledger_record()
+    await ledger.append(record)
+    with pytest.raises(ResourceConflictError) as captured:
+        await ledger.append(record)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_capacity_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger = InMemoryAuditLedger(maximum_entries=1, clock=lambda: datetime.now(UTC))
+    await ledger.append(_record())
+    with pytest.raises(AuditLedgerCapacityError) as captured:
+        await ledger.append(_secret_ledger_record())
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_closed_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.close()
+    with pytest.raises(AuditLedgerClosedError) as captured:
+        await ledger.append(_secret_ledger_record())
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_missing_sequence_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_secret_ledger_record())
+    with pytest.raises(ResourceNotFoundError) as captured:
+        await ledger.get(2)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_missing_record_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    ledger = InMemoryAuditLedger(clock=lambda: datetime.now(UTC))
+    await ledger.append(_secret_ledger_record())
+    with pytest.raises(ResourceNotFoundError) as captured:
+        await ledger.get_by_record_id(AuditRecordId())
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_ledger_malformed_entry_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+    entry = _ledger_entry(record=_secret_ledger_record())
+    value = entry.to_dict(_safe_policy())
+    cast(dict[str, object], value["record"])["summary"] = secret
+    value["entry_digest"] = "invalid"
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditLedgerEntry.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_ledger_clock_failure_error_omits_secret() -> None:
+    secret = "AUDIT-C2B1-LEDGER-SECRET-7ad291"
+
+    def fail() -> datetime:
+        raise RuntimeError(secret)
+
+    with pytest.raises(AuditLedgerError) as captured:
+        InMemoryAuditLedger(clock=fail)
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)
     assert secret not in str(captured.value.to_dict())

@@ -6,6 +6,7 @@ producer or create a tamper-proof ledger. Hash chaining and append-only storage 
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -18,15 +19,22 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from types import MappingProxyType
-from typing import Self, cast
+from typing import Protocol, Self, cast
 
 from alios_core.errors import (
     AuditContextError,
     AuditIntegrityError,
+    AuditLedgerCapacityError,
+    AuditLedgerClosedError,
+    AuditLedgerError,
+    AuditLedgerVerificationError,
     AuditSerializationError,
     AuditValidationError,
+    ResourceConflictError,
+    ResourceNotFoundError,
 )
 from alios_core.ids import (
+    AuditLedgerId,
     AuditRecordId,
     CorrelationId,
     Identifier,
@@ -44,6 +52,9 @@ from .tracing import TraceContext, TraceSource
 _CURRENT: ContextVar[AuditContext | None] = ContextVar("alios_audit_context", default=None)
 _TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/-]*$")
 _LOWER_HEX = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_HEX_LENGTH = 64
+_GENESIS_DIGEST = "0" * _SHA256_HEX_LENGTH
+_MAX_LEDGER_ENTRIES = 1_000_000
 
 
 def _validation(message: str, field_name: str | None = None) -> AuditValidationError:
@@ -760,3 +771,669 @@ class AuditRecord:
         if not isinstance(expected, str) or _LOWER_HEX.fullmatch(expected) is None:
             raise AuditIntegrityError("Invalid audit integrity digest")
         return hmac.compare_digest(self.integrity_digest(), expected)
+
+
+def _digest(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or _LOWER_HEX.fullmatch(value) is None:
+        raise AuditLedgerVerificationError(
+            "Invalid audit ledger digest", details={"field_name": field_name}
+        )
+    return value
+
+
+def _entry_digest(
+    ledger_id: AuditLedgerId,
+    sequence: int,
+    record_digest: str,
+    previous_digest: str,
+    appended_at: datetime,
+) -> str:
+    payload = json.dumps(
+        {
+            "ledger_id": str(ledger_id),
+            "sequence": sequence,
+            "record_digest": record_digest,
+            "previous_digest": previous_digest,
+            "appended_at": appended_at.astimezone(UTC).isoformat(),
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _positive_integer(value: object, field_name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise AuditLedgerError("Invalid audit ledger integer", details={"field_name": field_name})
+    return value
+
+
+def _nonnegative_integer(value: object, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise AuditLedgerError("Invalid audit ledger integer", details={"field_name": field_name})
+    return value
+
+
+def _ledger_aware(value: object, field_name: str) -> datetime:
+    try:
+        return _aware(value, field_name)
+    except AuditValidationError as error:
+        raise AuditLedgerError(
+            "Invalid audit ledger timestamp", details={"field_name": field_name}, cause=error
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLedgerEntry:
+    ledger_id: AuditLedgerId
+    sequence: int
+    record: AuditRecord
+    appended_at: datetime
+    previous_digest: str
+    record_digest: str
+    entry_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.ledger_id) is not AuditLedgerId:
+            raise AuditLedgerError("Invalid audit ledger identifier")
+        _positive_integer(self.sequence, "sequence")
+        if type(self.record) is not AuditRecord:
+            raise AuditLedgerError("Invalid audit ledger record")
+        _ledger_aware(self.appended_at, "appended_at")
+        previous = _digest(self.previous_digest, "previous_digest")
+        record_digest = _digest(self.record_digest, "record_digest")
+        entry_digest = _digest(self.entry_digest, "entry_digest")
+        if self.sequence == 1 and previous != _GENESIS_DIGEST:
+            raise AuditLedgerVerificationError("Invalid audit ledger genesis digest")
+        if not hmac.compare_digest(record_digest, self.record.integrity_digest()):
+            raise AuditLedgerVerificationError("Invalid audit ledger record digest")
+        expected = _entry_digest(
+            self.ledger_id, self.sequence, record_digest, previous, self.appended_at
+        )
+        if not hmac.compare_digest(entry_digest, expected):
+            raise AuditLedgerVerificationError("Invalid audit ledger entry digest")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        ledger_id: AuditLedgerId,
+        sequence: int,
+        record: AuditRecord,
+        appended_at: datetime,
+        previous_digest: str,
+    ) -> Self:
+        if type(ledger_id) is not AuditLedgerId:
+            raise AuditLedgerError("Invalid audit ledger identifier")
+        _positive_integer(sequence, "sequence")
+        if type(record) is not AuditRecord:
+            raise AuditLedgerError("Invalid audit ledger record")
+        _ledger_aware(appended_at, "appended_at")
+        previous = _digest(previous_digest, "previous_digest")
+        record_digest = record.integrity_digest()
+        entry_digest = _entry_digest(ledger_id, sequence, record_digest, previous, appended_at)
+        return cls(
+            ledger_id,
+            sequence,
+            record,
+            appended_at,
+            previous,
+            record_digest,
+            entry_digest,
+        )
+
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        return {
+            "ledger_id": str(self.ledger_id),
+            "sequence": self.sequence,
+            "record": self.record.to_dict(redaction_policy),
+            "appended_at": self.appended_at.isoformat(),
+            "previous_digest": self.previous_digest,
+            "record_digest": self.record_digest,
+            "entry_digest": self.entry_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("ledger_id"), str)
+                or type(value.get("sequence")) is not int
+                or not isinstance(value.get("record"), Mapping)
+                or not isinstance(value.get("appended_at"), str)
+                or any(
+                    not isinstance(value.get(name), str)
+                    for name in ("previous_digest", "record_digest", "entry_digest")
+                )
+            ):
+                raise ValueError
+            return cls(
+                AuditLedgerId(cast(str, value["ledger_id"])),
+                cast(int, value["sequence"]),
+                AuditRecord.from_dict(cast(Mapping[str, object], value["record"])),
+                datetime.fromisoformat(cast(str, value["appended_at"])),
+                cast(str, value["previous_digest"]),
+                cast(str, value["record_digest"]),
+                cast(str, value["entry_digest"]),
+            )
+        except (
+            TypeError,
+            ValueError,
+            AuditValidationError,
+            AuditSerializationError,
+            AuditLedgerError,
+            AuditLedgerVerificationError,
+        ) as error:
+            raise AuditSerializationError(
+                "Invalid serialized audit ledger entry", cause=error
+            ) from error
+
+
+class AuditLedgerVerificationFailure(_AuditEnum):
+    LEDGER_ID_MISMATCH = "ledger_id_mismatch"
+    GENESIS_MISMATCH = "genesis_mismatch"
+    SEQUENCE_MISMATCH = "sequence_mismatch"
+    PREVIOUS_DIGEST_MISMATCH = "previous_digest_mismatch"
+    RECORD_DIGEST_MISMATCH = "record_digest_mismatch"
+    ENTRY_DIGEST_MISMATCH = "entry_digest_mismatch"
+    APPENDED_TIME_REGRESSION = "appended_time_regression"
+    DUPLICATE_RECORD_ID = "duplicate_record_id"
+    HEAD_DIGEST_MISMATCH = "head_digest_mismatch"
+    ENTRY_COUNT_MISMATCH = "entry_count_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLedgerVerificationResult:
+    valid: bool
+    checked_entry_count: int
+    ledger_id: AuditLedgerId
+    first_sequence: int | None
+    last_sequence: int | None
+    head_digest: str | None
+    failure: AuditLedgerVerificationFailure | None = None
+    failure_sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.valid) is not bool or type(self.ledger_id) is not AuditLedgerId:
+            raise AuditLedgerError("Invalid audit ledger verification result")
+        _nonnegative_integer(self.checked_entry_count, "checked_entry_count")
+        for name in ("first_sequence", "last_sequence", "failure_sequence"):
+            item = getattr(self, name)
+            if item is not None:
+                _positive_integer(item, name)
+        if self.head_digest is not None:
+            _digest(self.head_digest, "head_digest")
+        if self.failure is not None and type(self.failure) is not AuditLedgerVerificationFailure:
+            raise AuditLedgerError("Invalid audit ledger verification failure")
+        if self.valid:
+            if self.failure is not None or self.failure_sequence is not None:
+                raise AuditLedgerError("Inconsistent audit ledger verification result")
+            if self.checked_entry_count == 0:
+                if any(
+                    item is not None
+                    for item in (self.first_sequence, self.last_sequence, self.head_digest)
+                ):
+                    raise AuditLedgerError("Inconsistent empty audit ledger verification result")
+            elif (
+                self.first_sequence != 1
+                or self.last_sequence != self.checked_entry_count
+                or self.head_digest is None
+            ):
+                raise AuditLedgerError("Inconsistent valid audit ledger verification result")
+        elif self.failure is None:
+            raise AuditLedgerError("Invalid verification result requires failure")
+
+    def require_valid(self) -> None:
+        if not self.valid:
+            details: dict[str, JsonValue] = {
+                "failure": cast(AuditLedgerVerificationFailure, self.failure).value
+            }
+            if self.failure_sequence is not None:
+                details["failure_sequence"] = self.failure_sequence
+            raise AuditLedgerVerificationError("Audit ledger verification failed", details=details)
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "valid": self.valid,
+            "checked_entry_count": self.checked_entry_count,
+            "ledger_id": str(self.ledger_id),
+            "first_sequence": self.first_sequence,
+            "last_sequence": self.last_sequence,
+            "head_digest": self.head_digest,
+            "failure": self.failure.value if self.failure is not None else None,
+            "failure_sequence": self.failure_sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or type(value.get("valid")) is not bool
+                or type(value.get("checked_entry_count")) is not int
+                or not isinstance(value.get("ledger_id"), str)
+                or value.get("first_sequence") is not None
+                and type(value.get("first_sequence")) is not int
+                or value.get("last_sequence") is not None
+                and type(value.get("last_sequence")) is not int
+                or value.get("head_digest") is not None
+                and not isinstance(value.get("head_digest"), str)
+                or value.get("failure") is not None
+                and not isinstance(value.get("failure"), str)
+                or value.get("failure_sequence") is not None
+                and type(value.get("failure_sequence")) is not int
+            ):
+                raise ValueError
+            failure = value.get("failure")
+            return cls(
+                cast(bool, value["valid"]),
+                cast(int, value["checked_entry_count"]),
+                AuditLedgerId(cast(str, value["ledger_id"])),
+                cast(int | None, value.get("first_sequence")),
+                cast(int | None, value.get("last_sequence")),
+                cast(str | None, value.get("head_digest")),
+                AuditLedgerVerificationFailure.parse(cast(str, failure))
+                if failure is not None
+                else None,
+                cast(int | None, value.get("failure_sequence")),
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            AuditValidationError,
+            AuditLedgerError,
+            AuditLedgerVerificationError,
+        ) as error:
+            raise AuditSerializationError(
+                "Invalid serialized audit ledger verification result", cause=error
+            ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLedgerStatus:
+    ledger_id: AuditLedgerId
+    entry_count: int
+    maximum_entries: int
+    next_sequence: int
+    head_digest: str | None
+    closed: bool
+    created_at: datetime
+    last_appended_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if type(self.ledger_id) is not AuditLedgerId or type(self.closed) is not bool:
+            raise AuditLedgerError("Invalid audit ledger status")
+        count = _nonnegative_integer(self.entry_count, "entry_count")
+        capacity = _positive_integer(self.maximum_entries, "maximum_entries")
+        next_sequence = _positive_integer(self.next_sequence, "next_sequence")
+        if count > capacity or next_sequence != count + 1:
+            raise AuditLedgerError("Inconsistent audit ledger status")
+        created = _ledger_aware(self.created_at, "created_at")
+        if self.last_appended_at is not None:
+            appended = _ledger_aware(self.last_appended_at, "last_appended_at")
+            if appended < created:
+                raise AuditLedgerError("Audit ledger append time precedes creation")
+        if count == 0:
+            if self.head_digest is not None or self.last_appended_at is not None:
+                raise AuditLedgerError("Inconsistent empty audit ledger status")
+        elif self.head_digest is None or self.last_appended_at is None:
+            raise AuditLedgerError("Inconsistent populated audit ledger status")
+        else:
+            _digest(self.head_digest, "head_digest")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "ledger_id": str(self.ledger_id),
+            "entry_count": self.entry_count,
+            "maximum_entries": self.maximum_entries,
+            "next_sequence": self.next_sequence,
+            "head_digest": self.head_digest,
+            "closed": self.closed,
+            "created_at": self.created_at.isoformat(),
+            "last_appended_at": self.last_appended_at.isoformat()
+            if self.last_appended_at is not None
+            else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("ledger_id"), str)
+                or type(value.get("entry_count")) is not int
+                or type(value.get("maximum_entries")) is not int
+                or type(value.get("next_sequence")) is not int
+                or value.get("head_digest") is not None
+                and not isinstance(value.get("head_digest"), str)
+                or type(value.get("closed")) is not bool
+                or not isinstance(value.get("created_at"), str)
+                or value.get("last_appended_at") is not None
+                and not isinstance(value.get("last_appended_at"), str)
+            ):
+                raise ValueError
+            last = value.get("last_appended_at")
+            return cls(
+                AuditLedgerId(cast(str, value["ledger_id"])),
+                cast(int, value["entry_count"]),
+                cast(int, value["maximum_entries"]),
+                cast(int, value["next_sequence"]),
+                cast(str | None, value.get("head_digest")),
+                cast(bool, value["closed"]),
+                datetime.fromisoformat(cast(str, value["created_at"])),
+                datetime.fromisoformat(last) if isinstance(last, str) else None,
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            AuditLedgerError,
+            AuditLedgerVerificationError,
+        ) as error:
+            raise AuditSerializationError(
+                "Invalid serialized audit ledger status", cause=error
+            ) from error
+
+
+class AuditLedger(Protocol):
+    async def append(self, record: AuditRecord) -> AuditLedgerEntry: ...
+
+    async def get(self, sequence: int) -> AuditLedgerEntry: ...
+
+    async def get_optional(self, sequence: int) -> AuditLedgerEntry | None: ...
+
+    async def get_by_record_id(self, record_id: AuditRecordId) -> AuditLedgerEntry: ...
+
+    async def get_optional_by_record_id(
+        self, record_id: AuditRecordId
+    ) -> AuditLedgerEntry | None: ...
+
+    async def entries(self) -> tuple[AuditLedgerEntry, ...]: ...
+
+    async def verify(self) -> AuditLedgerVerificationResult: ...
+
+    async def status(self) -> AuditLedgerStatus: ...
+
+    async def close(self) -> None: ...
+
+
+class InMemoryAuditLedger:
+    def __init__(
+        self,
+        *,
+        ledger_id: AuditLedgerId | None = None,
+        maximum_entries: int = 100_000,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        if ledger_id is not None and type(ledger_id) is not AuditLedgerId:
+            raise AuditLedgerError("Invalid audit ledger identifier")
+        capacity = _positive_integer(maximum_entries, "maximum_entries")
+        if capacity > _MAX_LEDGER_ENTRIES:
+            raise AuditLedgerCapacityError(
+                "Audit ledger capacity exceeds maximum",
+                details={"maximum_entries": _MAX_LEDGER_ENTRIES},
+            )
+        if not callable(clock):
+            raise AuditLedgerError("Invalid audit ledger clock")
+        try:
+            created_at = _aware(clock(), "created_at")
+        except AuditValidationError as error:
+            raise AuditLedgerError("Invalid audit ledger clock", cause=error) from error
+        except Exception as error:
+            raise AuditLedgerError("Audit ledger clock failed") from error
+        self._ledger_id = ledger_id if ledger_id is not None else AuditLedgerId()
+        self._maximum_entries = capacity
+        self._clock = clock
+        self._created_at = created_at
+        self._entries: list[AuditLedgerEntry] = []
+        self._sequence_index: dict[int, AuditLedgerEntry] = {}
+        self._record_index: dict[AuditRecordId, AuditLedgerEntry] = {}
+        self._head_digest: str | None = None
+        self._last_appended_at: datetime | None = None
+        self._entry_count = 0
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    async def append(self, record: AuditRecord) -> AuditLedgerEntry:
+        if type(record) is not AuditRecord:
+            raise AuditLedgerError("Invalid audit ledger record")
+        async with self._lock:
+            if self._closed:
+                raise AuditLedgerClosedError(
+                    "Audit ledger is closed", details={"ledger_id": str(self._ledger_id)}
+                )
+            if record.record_id in self._record_index:
+                raise ResourceConflictError(
+                    "Audit record already exists", details={"record_id": str(record.record_id)}
+                )
+            if self._entry_count >= self._maximum_entries:
+                raise AuditLedgerCapacityError(
+                    "Audit ledger capacity reached",
+                    details={
+                        "entry_count": self._entry_count,
+                        "maximum_entries": self._maximum_entries,
+                    },
+                )
+            try:
+                appended_at = _aware(self._clock(), "appended_at")
+            except AuditValidationError as error:
+                raise AuditLedgerError("Invalid audit ledger clock", cause=error) from error
+            except Exception as error:
+                raise AuditLedgerError("Audit ledger clock failed") from error
+            floor = self._last_appended_at or self._created_at
+            if appended_at < floor:
+                raise AuditLedgerError("Audit ledger clock regressed")
+            sequence = self._entry_count + 1
+            previous = self._head_digest or _GENESIS_DIGEST
+            entry = AuditLedgerEntry.create(
+                ledger_id=self._ledger_id,
+                sequence=sequence,
+                record=record,
+                appended_at=appended_at,
+                previous_digest=previous,
+            )
+            self._entries.append(entry)
+            self._sequence_index[sequence] = entry
+            self._record_index[record.record_id] = entry
+            self._head_digest = entry.entry_digest
+            self._last_appended_at = appended_at
+            self._entry_count = sequence
+            return entry
+
+    async def get(self, sequence: int) -> AuditLedgerEntry:
+        _positive_integer(sequence, "sequence")
+        async with self._lock:
+            try:
+                return self._sequence_index[sequence]
+            except KeyError as error:
+                raise ResourceNotFoundError(
+                    "Audit ledger sequence not found", details={"sequence": sequence}
+                ) from error
+
+    async def get_optional(self, sequence: int) -> AuditLedgerEntry | None:
+        _positive_integer(sequence, "sequence")
+        async with self._lock:
+            return self._sequence_index.get(sequence)
+
+    async def get_by_record_id(self, record_id: AuditRecordId) -> AuditLedgerEntry:
+        if type(record_id) is not AuditRecordId:
+            raise AuditLedgerError("Invalid audit record identifier")
+        async with self._lock:
+            try:
+                return self._record_index[record_id]
+            except KeyError as error:
+                raise ResourceNotFoundError(
+                    "Audit record not found", details={"record_id": str(record_id)}
+                ) from error
+
+    async def get_optional_by_record_id(self, record_id: AuditRecordId) -> AuditLedgerEntry | None:
+        if type(record_id) is not AuditRecordId:
+            raise AuditLedgerError("Invalid audit record identifier")
+        async with self._lock:
+            return self._record_index.get(record_id)
+
+    async def entries(self) -> tuple[AuditLedgerEntry, ...]:
+        async with self._lock:
+            return tuple(self._entries)
+
+    async def status(self) -> AuditLedgerStatus:
+        async with self._lock:
+            return AuditLedgerStatus(
+                self._ledger_id,
+                self._entry_count,
+                self._maximum_entries,
+                self._entry_count + 1,
+                self._head_digest,
+                self._closed,
+                self._created_at,
+                self._last_appended_at,
+            )
+
+    async def verify(self) -> AuditLedgerVerificationResult:
+        async with self._lock:
+            entries = tuple(self._entries)
+            ledger_id = self._ledger_id
+            head_digest = self._head_digest
+            stored_count = self._entry_count
+        return _verify_chain(entries, ledger_id, head_digest, stored_count)
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+
+
+def _invalid_verification(
+    ledger_id: AuditLedgerId,
+    checked_count: int,
+    failure: AuditLedgerVerificationFailure,
+    sequence: int | None,
+    entries: tuple[AuditLedgerEntry, ...],
+    head_digest: str | None,
+) -> AuditLedgerVerificationResult:
+    return AuditLedgerVerificationResult(
+        False,
+        checked_count,
+        ledger_id,
+        entries[0].sequence if entries else None,
+        entries[-1].sequence if entries else None,
+        head_digest,
+        failure,
+        sequence,
+    )
+
+
+def _verify_chain(
+    entries: tuple[AuditLedgerEntry, ...],
+    ledger_id: AuditLedgerId,
+    head_digest: str | None,
+    stored_count: int,
+) -> AuditLedgerVerificationResult:
+    previous_digest = _GENESIS_DIGEST
+    previous_time: datetime | None = None
+    record_ids: set[AuditRecordId] = set()
+    for index, entry in enumerate(entries, start=1):
+        if entry.ledger_id != ledger_id:
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.LEDGER_ID_MISMATCH,
+                index,
+                entries,
+                head_digest,
+            )
+        if entry.sequence != index:
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.SEQUENCE_MISMATCH,
+                index,
+                entries,
+                head_digest,
+            )
+        expected_previous_failure = (
+            AuditLedgerVerificationFailure.GENESIS_MISMATCH
+            if index == 1
+            else AuditLedgerVerificationFailure.PREVIOUS_DIGEST_MISMATCH
+        )
+        if entry.previous_digest != previous_digest:
+            return _invalid_verification(
+                ledger_id, index, expected_previous_failure, index, entries, head_digest
+            )
+        if entry.record.record_id in record_ids:
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.DUPLICATE_RECORD_ID,
+                index,
+                entries,
+                head_digest,
+            )
+        record_ids.add(entry.record.record_id)
+        if entry.record_digest != entry.record.integrity_digest():
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.RECORD_DIGEST_MISMATCH,
+                index,
+                entries,
+                head_digest,
+            )
+        expected_entry_digest = _entry_digest(
+            entry.ledger_id,
+            entry.sequence,
+            entry.record_digest,
+            entry.previous_digest,
+            entry.appended_at,
+        )
+        if entry.entry_digest != expected_entry_digest:
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.ENTRY_DIGEST_MISMATCH,
+                index,
+                entries,
+                head_digest,
+            )
+        if previous_time is not None and entry.appended_at < previous_time:
+            return _invalid_verification(
+                ledger_id,
+                index,
+                AuditLedgerVerificationFailure.APPENDED_TIME_REGRESSION,
+                index,
+                entries,
+                head_digest,
+            )
+        previous_digest = entry.entry_digest
+        previous_time = entry.appended_at
+    if entries and head_digest != entries[-1].entry_digest:
+        return _invalid_verification(
+            ledger_id,
+            len(entries),
+            AuditLedgerVerificationFailure.HEAD_DIGEST_MISMATCH,
+            len(entries),
+            entries,
+            head_digest,
+        )
+    if len(entries) != stored_count:
+        return _invalid_verification(
+            ledger_id,
+            len(entries),
+            AuditLedgerVerificationFailure.ENTRY_COUNT_MISMATCH,
+            None,
+            entries,
+            head_digest,
+        )
+    if not entries:
+        return AuditLedgerVerificationResult(True, 0, ledger_id, None, None, None)
+    return AuditLedgerVerificationResult(
+        True,
+        len(entries),
+        ledger_id,
+        1,
+        len(entries),
+        cast(str, head_digest),
+    )
