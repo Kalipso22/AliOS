@@ -37,6 +37,18 @@ from .metrics import (
     MetricRegistryStatus,
     MetricSample,
 )
+from .tracing import (
+    SpanEvent,
+    SpanKind,
+    SpanLink,
+    SpanRecord,
+    SpanStatus,
+    TraceContext,
+    TraceSource,
+    bind_trace_context,
+    current_trace_context,
+    require_trace_context,
+)
 
 __all__ = [
     "InMemoryLogSink",
@@ -72,4 +84,14 @@ __all__ = [
     "MetricRegistrySnapshot",
     "MetricSample",
     "MetricRegistryStatus",
+    "SpanEvent",
+    "SpanKind",
+    "SpanLink",
+    "SpanRecord",
+    "SpanStatus",
+    "TraceContext",
+    "TraceSource",
+    "bind_trace_context",
+    "current_trace_context",
+    "require_trace_context",
 ]

@@ -128,6 +128,22 @@ class LogSinkError(LoggingError):
     code = "log_sink_error"
 
 
+class TracingError(ObservabilityError):
+    code = "tracing_error"
+
+
+class TraceContextError(TracingError):
+    code = "trace_context_error"
+
+
+class TraceSerializationError(TracingError):
+    code = "trace_serialization_error"
+
+
+class SpanValidationError(TracingError):
+    code = "span_validation_error"
+
+
 class MetricsError(ObservabilityError):
     code = "metrics_error"
 

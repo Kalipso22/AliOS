@@ -95,3 +95,11 @@ class CheckpointId(Identifier):
 
 class LogRecordId(Identifier):
     pass
+
+
+class TraceId(Identifier):
+    pass
+
+
+class SpanId(Identifier):
+    pass

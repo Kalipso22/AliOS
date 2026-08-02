@@ -12,7 +12,7 @@ from .config import (
 )
 from .container import Container, ServiceKey, ServiceLifetime
 from .events import AsyncEventBus, BaseEvent, DispatchMode, Event, EventBus, PolicyEvaluated
-from .ids import CorrelationId, LogRecordId, RunId
+from .ids import CorrelationId, LogRecordId, RunId, SpanId, TraceId
 from .lifecycle import LifecycleHealth, LifecycleManager, LifecycleState, ManagedLifecycleComponent
 from .policy import (
     InMemoryPolicyEvaluator,
@@ -61,4 +61,6 @@ __all__ = [
     "ServiceLifetime",
     "SettingsSnapshot",
     "SourceMetadata",
+    "SpanId",
+    "TraceId",
 ]
