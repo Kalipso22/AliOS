@@ -389,6 +389,50 @@ class HistogramPoint:
             "updated_at": self.updated_at.isoformat(),
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        descriptor = value.get("descriptor")
+        labels = value.get("labels")
+        buckets = value.get("bucket_counts")
+        created = value.get("created_at")
+        updated = value.get("updated_at")
+        try:
+            if (
+                not isinstance(descriptor, Mapping)
+                or not isinstance(labels, Mapping)
+                or not isinstance(buckets, (list, tuple))
+                or not all(isinstance(item, int) and not isinstance(item, bool) for item in buckets)
+                or not isinstance(created, str)
+                or not isinstance(updated, str)
+            ):
+                raise ValueError
+            count = value.get("count")
+            total = value.get("sum")
+            minimum = value.get("minimum")
+            maximum = value.get("maximum")
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or any(
+                    isinstance(item, bool) or not isinstance(item, (int, float))
+                    for item in (total, minimum, maximum)
+                )
+            ):
+                raise ValueError
+            return cls(
+                MetricDescriptor.from_dict(descriptor),
+                MetricLabelSet.from_dict(labels),
+                tuple(buckets),
+                count,
+                cast(int | float, total),
+                cast(int | float | None, minimum),
+                cast(int | float | None, maximum),
+                datetime.fromisoformat(created),
+                datetime.fromisoformat(updated),
+            )
+        except (TypeError, ValueError, MetricDefinitionError, MetricValueError) as error:
+            raise MetricValueError("Invalid histogram point") from error
+
 
 MetricSample = MetricPoint | HistogramPoint
 
@@ -767,6 +811,44 @@ class MetricRegistrySnapshot:
             "collected_at": self.collected_at.isoformat(),
             "filtered": self.filtered,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        status = value.get("status")
+        descriptors = value.get("descriptors")
+        samples = value.get("samples")
+        collected = value.get("collected_at")
+        filtered = value.get("filtered", False)
+        try:
+            if (
+                not isinstance(status, Mapping)
+                or not isinstance(descriptors, (list, tuple))
+                or not all(isinstance(item, Mapping) for item in descriptors)
+                or not isinstance(samples, (list, tuple))
+                or not all(isinstance(item, Mapping) for item in samples)
+                or not isinstance(collected, str)
+                or not isinstance(filtered, bool)
+            ):
+                raise ValueError
+            restored: list[MetricSample] = []
+            for item in samples:
+                sample_type = item.get("sample_type")
+                payload = {key: entry for key, entry in item.items() if key != "sample_type"}
+                if sample_type == "scalar":
+                    restored.append(MetricPoint.from_dict(payload))
+                elif sample_type == "histogram":
+                    restored.append(HistogramPoint.from_dict(payload))
+                else:
+                    raise ValueError
+            return cls(
+                MetricRegistryStatus.from_dict(status),
+                tuple(MetricDescriptor.from_dict(item) for item in descriptors),
+                tuple(restored),
+                datetime.fromisoformat(collected),
+                filtered,
+            )
+        except (TypeError, ValueError, MetricDefinitionError, MetricValueError) as error:
+            raise MetricValueError("Invalid metric registry snapshot") from error
 
 
 class InMemoryMetricRegistry:
