@@ -139,6 +139,16 @@ source = { virtual = "packages/providers" }
 name = "alios-runtime"
 version = "0.1.0"
 source = { virtual = "packages/runtime" }
+dependencies = [
+    { name = "alios-core" },
+    { name = "alios-observability" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "alios-core", editable = "packages/core" },
+    { name = "alios-observability", editable = "packages/observability" },
+]
 
 [[package]]
 name = "alios-sdk"

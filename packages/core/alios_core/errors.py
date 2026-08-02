@@ -116,6 +116,30 @@ class ObservabilityError(AliOSError):
     code = "observability_error"
 
 
+class RuntimeObservabilityError(ObservabilityError):
+    code = "runtime_observability_error"
+
+
+class RuntimeObservabilityConfigurationError(RuntimeObservabilityError):
+    code = "runtime_observability_configuration_error"
+
+
+class RuntimeObservabilityContextError(RuntimeObservabilityError):
+    code = "runtime_observability_context_error"
+
+
+class RuntimeObservabilityLifecycleError(RuntimeObservabilityError):
+    code = "runtime_observability_lifecycle_error"
+
+
+class RuntimeObservabilityClosedError(RuntimeObservabilityLifecycleError):
+    code = "runtime_observability_closed"
+
+
+class RuntimeObservabilityEmissionError(RuntimeObservabilityError):
+    code = "runtime_observability_emission_error"
+
+
 class LoggingError(ObservabilityError):
     code = "logging_error"
 
