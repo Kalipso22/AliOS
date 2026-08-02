@@ -656,7 +656,7 @@ def test_trace_binding_rejects_wrong_context_type() -> None:
         bind_trace_context(cast(TraceContext, "invalid"))
 
 
-def test_trace_binding_rejects_reentry() -> None:
+def test_trace_binding_rejects_concurrent_reentry() -> None:
     binding = bind_trace_context(_context())
     with binding:
         with pytest.raises(TraceContextError):
@@ -832,7 +832,7 @@ def test_trace_data_str_enum_normalizes_to_plain_string() -> None:
     assert event.to_dict()["attributes"] == {"kind": "client"}
 
 
-def test_trace_attribute_naive_datetime_is_rejected() -> None:
+def test_trace_attribute_naive_datetime_raises_serialization_error() -> None:
     with pytest.raises(TraceSerializationError):
         SpanEvent("event", datetime.now(UTC), {"at": datetime.now()})
 

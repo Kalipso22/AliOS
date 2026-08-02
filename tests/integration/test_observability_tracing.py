@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
@@ -260,20 +261,49 @@ def test_default_redaction_policy_does_not_mutate_global_state() -> None:
 async def test_trace_models_do_not_create_global_tasks() -> None:
     import importlib
 
-    before = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
-    tracing = importlib.import_module("alios_observability.tracing")
+    current = asyncio.current_task()
+    assert current is not None
+    before = {task for task in asyncio.all_tasks() if task is not current and not task.done()}
+    module = importlib.import_module("alios_observability.tracing")
+    assert module is sys.modules["alios_observability.tracing"]
     await asyncio.sleep(0)
-    after = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
-    assert tracing.TraceContext is TraceContext and after == before
+    after = {task for task in asyncio.all_tasks() if task is not current and not task.done()}
+    assert after == before
+    assert not any(isinstance(value, asyncio.Task) for value in vars(module).values())
+
+
+def test_public_tracing_imports_preserve_class_identity() -> None:
+    import alios_observability
+    import alios_observability.tracing as tracing
+
+    assert alios_observability.TraceContext is tracing.TraceContext
+    assert alios_observability.SpanRecord is tracing.SpanRecord
+    assert alios_observability.SpanEvent is tracing.SpanEvent
+    assert alios_observability.SpanLink is tracing.SpanLink
+    now = datetime.now(UTC)
+    context = alios_observability.TraceContext.create_root()
+    record = alios_observability.SpanRecord(
+        context,
+        "identity",
+        alios_observability.TraceSource("integration"),
+        alios_observability.SpanKind.INTERNAL,
+        alios_observability.SpanStatus.OK,
+        now,
+        now,
+    )
+    assert isinstance(context, tracing.TraceContext) and isinstance(record, tracing.SpanRecord)
 
 
 def test_public_tracing_imports_preserve_logging_exports() -> None:
-    from alios_observability import InMemoryLogSink, StructuredLogger
+    import alios_observability
+    import alios_observability.logging as logging
 
-    assert isinstance(InMemoryLogSink, type) and isinstance(StructuredLogger, type)
+    assert alios_observability.InMemoryLogSink is logging.InMemoryLogSink
+    assert alios_observability.StructuredLogger is logging.StructuredLogger
 
 
 def test_public_tracing_imports_preserve_metrics_exports() -> None:
-    from alios_observability import InMemoryMetricRegistry
+    import alios_observability
+    import alios_observability.metrics as metrics
 
-    assert isinstance(InMemoryMetricRegistry, type)
+    assert alios_observability.InMemoryMetricRegistry is metrics.InMemoryMetricRegistry
