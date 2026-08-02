@@ -314,7 +314,12 @@ async def test_valid_recovery_after_stale_plan_rejection() -> None:
         state={},
     )
     valid = await coordinator.create_plan(plan.run_id, checkpoint_id=replacement.checkpoint_id)
-    assert (await coordinator.recover(valid, lambda item, _: RecoveredPayload(item.state))).success
+
+    def restore(item: Checkpoint | None, _: object) -> RecoveredPayload:
+        assert item is not None
+        return RecoveredPayload(item.state)
+
+    assert (await coordinator.recover(valid, restore)).success
 
 
 @pytest.mark.asyncio

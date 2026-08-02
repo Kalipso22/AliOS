@@ -239,6 +239,7 @@ async def test_recovery_completed_direct_dispatch_preserves_fields() -> None:
     await bus.subscribe(RecoveryCompleted, received.append)
     result = await bus.dispatch(event)
     assert received == [event]
+    assert isinstance(result.event, RecoveryCompleted)
     assert result.event.run_id == event.run_id
     assert result.event.recovery_id == event.recovery_id
     assert result.event.mode == event.mode
@@ -257,6 +258,7 @@ async def test_recovery_completed_queued_publish_preserves_fields() -> None:
         await bus.subscribe(RecoveryCompleted, received.append)
         result = await bus.publish(event)
     assert received == [event]
+    assert isinstance(result.event, RecoveryCompleted)
     assert result.event.run_id == event.run_id
     assert result.event.recovery_id == event.recovery_id
     assert result.event.mode == event.mode

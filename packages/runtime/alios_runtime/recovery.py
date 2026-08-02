@@ -589,7 +589,9 @@ class RecoveryCoordinator:
     ) -> RecoveryPlan:
         run = await self.run_manager.get_run(run_id)
         checkpoint = (
-            await self.repository.get(checkpoint_id)
+            None
+            if mode is RecoveryMode.RESTART
+            else await self.repository.get(checkpoint_id)
             if checkpoint_id
             else await self.repository.latest(run_id)
         )

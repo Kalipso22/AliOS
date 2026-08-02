@@ -198,6 +198,7 @@ class Runtime(ManagedLifecycleComponent):
         checkpoint_state: Mapping[str, Any] | None = None,
         policy_request: RuntimePolicyRequest | None = None,
         _existing_run: RunRecord | None = None,
+        _allow_terminal_parent: bool = False,
     ) -> RuntimeExecutionResult[T]:
         if not self._accepting:
             raise ValidationError("Runtime is not running")
@@ -207,6 +208,8 @@ class Runtime(ManagedLifecycleComponent):
             correlation_id=context.correlation_id,
             tenant_id=context.tenant_id,
             user_id=context.user_id,
+            parent_run_id=context.parent_run_id,
+            allow_terminal_parent=_allow_terminal_parent,
             idempotency_key=idempotency_key,
             execution_mode=context.execution_mode,
             deadline=context.deadline,
@@ -489,7 +492,11 @@ class Runtime(ManagedLifecycleComponent):
             )
         else:
             context = (
-                recovered.recovered_context.create_child()
+                recovered.recovered_context.create_child(
+                    metadata={},
+                ).create_retry(
+                    inherit_cancellation=False,
+                )
                 if plan.mode is not RecoveryMode.RESTART
                 else ExecutionContext.create(correlation_id=plan.correlation_id)
             )
@@ -501,6 +508,7 @@ class Runtime(ManagedLifecycleComponent):
                 checkpoint_state={}
                 if plan.mode is RecoveryMode.RESTART
                 else recovered.recovered_state,
+                _allow_terminal_parent=plan.mode in {RecoveryMode.RESUME, RecoveryMode.RETRY},
             )
         return RuntimeExecutionResult(
             result.run,
