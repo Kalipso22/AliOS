@@ -32,6 +32,7 @@ _RESERVED = frozenset({"__name__", "__metric__", "__kind__", "__unit__", "__desc
 class MetricKind(StrEnum):
     COUNTER = "counter"
     GAUGE = "gauge"
+    HISTOGRAM = "histogram"
 
     @classmethod
     def parse(cls, value: str) -> Self:
@@ -145,6 +146,7 @@ class MetricDescriptor:
     unit: str | None = None
     label_names: tuple[str, ...] = ()
     maximum_series: int = 1_000
+    histogram_boundaries: tuple[int | float, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name))
@@ -178,6 +180,27 @@ class MetricDescriptor:
         ):
             raise MetricDefinitionError("Invalid metric series limit")
         object.__setattr__(self, "label_names", labels)
+        boundaries = self.histogram_boundaries
+        if self.kind is MetricKind.HISTOGRAM:
+            if (
+                not isinstance(boundaries, tuple | list)
+                or not boundaries
+                or len(boundaries) > 1_000
+            ):
+                raise MetricDefinitionError("Invalid histogram boundaries")
+            checked: list[int | float] = []
+            for boundary in boundaries:
+                if (
+                    isinstance(boundary, bool)
+                    or not isinstance(boundary, (int, float))
+                    or not math.isfinite(boundary)
+                    or (checked and boundary <= checked[-1])
+                ):
+                    raise MetricDefinitionError("Invalid histogram boundaries")
+                checked.append(boundary)
+            object.__setattr__(self, "histogram_boundaries", tuple(checked))
+        elif boundaries is not None:
+            raise MetricDefinitionError("Histogram boundaries require a histogram")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -187,27 +210,49 @@ class MetricDescriptor:
             "unit": self.unit,
             "label_names": list(self.label_names),
             "maximum_series": self.maximum_series,
+            "histogram_boundaries": list(self.histogram_boundaries)
+            if self.histogram_boundaries
+            else None,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
         try:
             labels = value.get("label_names", ())
+            name = value.get("name")
+            kind = value.get("kind")
+            description = value.get("description")
             if not isinstance(labels, tuple | list) or not all(isinstance(x, str) for x in labels):
                 raise ValueError
             unit = value.get("unit")
             maximum_series = value.get("maximum_series", 1000)
+            boundaries = value.get("histogram_boundaries")
             if unit is not None and not isinstance(unit, str):
+                raise ValueError
+            if (
+                not isinstance(name, str)
+                or not isinstance(kind, str)
+                or not isinstance(description, str)
+            ):
                 raise ValueError
             if isinstance(maximum_series, bool) or not isinstance(maximum_series, (int, str)):
                 raise ValueError
+            if boundaries is not None and (
+                not isinstance(boundaries, (tuple, list))
+                or any(
+                    isinstance(item, bool) or not isinstance(item, (int, float))
+                    for item in boundaries
+                )
+            ):
+                raise ValueError
             return cls(
-                str(value["name"]),
-                MetricKind.parse(str(value["kind"])),
-                str(value["description"]),
+                name,
+                MetricKind.parse(kind),
+                description,
                 unit,
                 tuple(labels),
                 int(maximum_series),
+                tuple(boundaries) if boundaries is not None else None,
             )
         except (KeyError, TypeError, ValueError, ValidationError) as error:
             raise MetricDefinitionError("Invalid metric descriptor") from error
@@ -280,10 +325,74 @@ class MetricPoint:
             raise MetricValueError("Invalid metric point") from error
 
 
+@dataclass(frozen=True, slots=True)
+class HistogramPoint:
+    descriptor: MetricDescriptor
+    labels: MetricLabelSet
+    bucket_counts: tuple[int, ...]
+    count: int
+    sum: int | float
+    minimum: int | float | None
+    maximum: int | float | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.descriptor, MetricDescriptor)
+            or self.descriptor.kind is not MetricKind.HISTOGRAM
+            or not isinstance(self.labels, MetricLabelSet)
+        ):
+            raise MetricValueError("Invalid histogram point")
+        boundaries = self.descriptor.histogram_boundaries or ()
+        if (
+            len(self.bucket_counts) != len(boundaries) + 1
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in self.bucket_counts
+            )
+            or any(
+                right < left
+                for left, right in zip(self.bucket_counts, self.bucket_counts[1:], strict=False)
+            )
+            or isinstance(self.count, bool)
+            or not isinstance(self.count, int)
+            or self.count < 1
+            or self.bucket_counts[-1] != self.count
+        ):
+            raise MetricValueError("Invalid histogram point")
+        _number(self.sum)
+        _aware(self.created_at)
+        _aware(self.updated_at)
+        if (
+            self.minimum is None
+            or self.maximum is None
+            or _number(self.minimum) > _number(self.maximum)
+            or self.updated_at < self.created_at
+        ):
+            raise MetricValueError("Invalid histogram point")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "descriptor": self.descriptor.to_dict(),
+            "labels": self.labels.to_dict(),
+            "bucket_counts": list(self.bucket_counts),
+            "count": self.count,
+            "sum": self.sum,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+MetricSample = MetricPoint | HistogramPoint
+
+
 class MetricInstrument(Protocol):
     @property
     def descriptor(self) -> MetricDescriptor: ...
-    async def collect(self) -> tuple[MetricPoint, ...]: ...
+    async def collect(self) -> tuple[MetricSample, ...]: ...
     async def series_count(self) -> int: ...
 
 
@@ -300,6 +409,12 @@ class Gauge(MetricInstrument, Protocol):
     async def set(
         self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
     ) -> MetricPoint: ...
+
+
+class Histogram(MetricInstrument, Protocol):
+    async def observe(
+        self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> HistogramPoint: ...
     async def add(
         self, amount: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
     ) -> MetricPoint: ...
@@ -311,6 +426,7 @@ class Gauge(MetricInstrument, Protocol):
 class MetricRegistry(Protocol):
     async def register_counter(self, descriptor: MetricDescriptor) -> Counter: ...
     async def register_gauge(self, descriptor: MetricDescriptor) -> Gauge: ...
+    async def register_histogram(self, descriptor: MetricDescriptor) -> Histogram: ...
     async def get(self, name: str) -> MetricInstrument: ...
     async def get_optional(self, name: str) -> MetricInstrument | None: ...
     async def list_descriptors(self) -> tuple[MetricDescriptor, ...]: ...
@@ -342,7 +458,7 @@ class _Instrument:
         async with self._lock:
             return len(self._series)
 
-    async def collect(self) -> tuple[MetricPoint, ...]:
+    async def collect(self) -> tuple[MetricSample, ...]:
         async with self._lock:
             return tuple(
                 sorted(self._series.values(), key=lambda point: tuple(point.labels.values.items()))
@@ -414,6 +530,68 @@ class _Gauge(_Instrument):
         return await self._update(lambda value: value - amount, labels)
 
 
+class _Histogram:
+    def __init__(self, descriptor: MetricDescriptor, clock: Callable[[], datetime]) -> None:
+        self._descriptor = descriptor
+        self._clock = clock
+        self._series: dict[MetricLabelSet, HistogramPoint] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def descriptor(self) -> MetricDescriptor:
+        return self._descriptor
+
+    def _labels(self, labels: MetricLabelSet | Mapping[str, object] | None) -> MetricLabelSet:
+        result = labels if isinstance(labels, MetricLabelSet) else MetricLabelSet.create(labels)
+        if tuple(result.values) != tuple(sorted(self._descriptor.label_names)):
+            raise MetricValueError("Metric label schema mismatch")
+        return result
+
+    async def series_count(self) -> int:
+        async with self._lock:
+            return len(self._series)
+
+    async def observe(
+        self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> HistogramPoint:
+        value = _number(value)
+        label_set = self._labels(labels)
+        async with self._lock:
+            current = self._series.get(label_set)
+            if current is None and len(self._series) >= self._descriptor.maximum_series:
+                raise MetricCardinalityError("Metric series limit reached")
+            now = _aware(self._clock())
+            if current is not None and now < current.updated_at:
+                raise MetricValueError("Metric clock moved backwards")
+            boundaries = self._descriptor.histogram_boundaries or ()
+            buckets = (
+                [0] * (len(boundaries) + 1) if current is None else list(current.bucket_counts)
+            )
+            for index, boundary in enumerate(boundaries):
+                if value <= boundary:
+                    buckets[index] += 1
+            buckets[-1] += 1
+            point = HistogramPoint(
+                self._descriptor,
+                label_set,
+                tuple(buckets),
+                1 if current is None else current.count + 1,
+                value if current is None else _number(current.sum + value),
+                value if current is None else min(current.minimum or value, value),
+                value if current is None else max(current.maximum or value, value),
+                now if current is None else current.created_at,
+                now,
+            )
+            self._series[label_set] = point
+            return point
+
+    async def collect(self) -> tuple[HistogramPoint, ...]:
+        async with self._lock:
+            return tuple(
+                sorted(self._series.values(), key=lambda point: tuple(point.labels.values.items()))
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class MetricRegistryStatus:
     instrument_count: int
@@ -480,12 +658,12 @@ class InMemoryMetricRegistry:
         self._default = default_maximum_series
         self._maximum = maximum_instruments
         self._clock = clock
-        self._items: dict[str, _Instrument] = {}
+        self._items: dict[str, _Instrument | _Histogram] = {}
         self._lock = asyncio.Lock()
         self._closed = False
         self._created_at = _aware(clock())
 
-    async def _register(self, d: MetricDescriptor) -> _Instrument:
+    async def _register(self, d: MetricDescriptor) -> _Instrument | _Histogram:
         async with self._lock:
             if self._closed:
                 raise MetricRegistryClosedError("Metric registry is closed")
@@ -496,21 +674,31 @@ class InMemoryMetricRegistry:
                     "Metric instrument limit reached",
                     {"maximum_instruments": self._maximum, "instrument_count": len(self._items)},
                 )
-            item: _Instrument = (
-                _Counter(d, self._clock) if d.kind is MetricKind.COUNTER else _Gauge(d, self._clock)
-            )
+            if d.kind is MetricKind.COUNTER:
+                item: _Instrument | _Histogram = _Counter(d, self._clock)
+            elif d.kind is MetricKind.GAUGE:
+                item = _Gauge(d, self._clock)
+            elif d.kind is MetricKind.HISTOGRAM:
+                item = _Histogram(d, self._clock)
+            else:
+                raise MetricDefinitionError("Invalid metric kind")
             self._items[d.name] = item
             return item
 
     async def register_counter(self, d: MetricDescriptor) -> Counter:
-        if d.kind is not MetricKind.COUNTER:
+        if not isinstance(d, MetricDescriptor) or d.kind is not MetricKind.COUNTER:
             raise MetricDefinitionError("Metric kind mismatch")
         return cast(Counter, await self._register(d))
 
     async def register_gauge(self, d: MetricDescriptor) -> Gauge:
-        if d.kind is not MetricKind.GAUGE:
+        if not isinstance(d, MetricDescriptor) or d.kind is not MetricKind.GAUGE:
             raise MetricDefinitionError("Metric kind mismatch")
         return cast(Gauge, await self._register(d))
+
+    async def register_histogram(self, d: MetricDescriptor) -> Histogram:
+        if not isinstance(d, MetricDescriptor) or d.kind is not MetricKind.HISTOGRAM:
+            raise MetricDefinitionError("Metric kind mismatch")
+        return cast(Histogram, await self._register(d))
 
     async def counter(
         self,
@@ -552,6 +740,28 @@ class InMemoryMetricRegistry:
             )
         )
 
+    async def histogram(
+        self,
+        name: str,
+        *,
+        description: str,
+        boundaries: tuple[int | float, ...],
+        unit: str | None = None,
+        label_names: tuple[str, ...] = (),
+        maximum_series: int | None = None,
+    ) -> Histogram:
+        return await self.register_histogram(
+            MetricDescriptor(
+                name,
+                MetricKind.HISTOGRAM,
+                description,
+                unit,
+                label_names,
+                self._default if maximum_series is None else maximum_series,
+                boundaries,
+            )
+        )
+
     async def get_optional(self, name: str) -> MetricInstrument | None:
         _name(name)
         async with self._lock:
@@ -575,14 +785,20 @@ class InMemoryMetricRegistry:
             raise MetricDefinitionError("Metric kind mismatch")
         return cast(Gauge, item)
 
+    async def get_histogram(self, name: str) -> Histogram:
+        item = await self.get(name)
+        if item.descriptor.kind is not MetricKind.HISTOGRAM:
+            raise MetricDefinitionError("Metric kind mismatch")
+        return cast(Histogram, item)
+
     async def list_descriptors(self) -> tuple[MetricDescriptor, ...]:
         async with self._lock:
             return tuple(self._items[name].descriptor for name in sorted(self._items))
 
-    async def collect(self) -> tuple[MetricPoint, ...]:
+    async def collect(self) -> tuple[MetricSample, ...]:
         async with self._lock:
             items = tuple(self._items.items())
-        points = [point for _, item in items for point in await item.collect()]
+        points: list[MetricSample] = [point for _, item in items for point in await item.collect()]
         return tuple(
             sorted(
                 points,

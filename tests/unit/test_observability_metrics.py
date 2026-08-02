@@ -52,3 +52,11 @@ def test_label_set_preserves_distinct_valid_scalar_series(case: int) -> None:
     restored = MetricLabelSet.from_dict(labels.to_dict())
     assert restored == labels
     assert restored.to_dict()["status_code"] == str(200 + case)
+
+
+@pytest.mark.parametrize("case", range(100))
+def test_histogram_descriptor_preserves_distinct_valid_boundaries(case: int) -> None:
+    descriptor = MetricDescriptor(
+        f"latency_{case}", MetricKind.HISTOGRAM, "Latency", histogram_boundaries=(case, case + 1)
+    )
+    assert descriptor.histogram_boundaries == (case, case + 1)

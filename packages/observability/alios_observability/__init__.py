@@ -23,6 +23,8 @@ from .logging import (
 from .metrics import (
     Counter,
     Gauge,
+    Histogram,
+    HistogramPoint,
     InMemoryMetricRegistry,
     MetricDescriptor,
     MetricInstrument,
@@ -31,6 +33,7 @@ from .metrics import (
     MetricPoint,
     MetricRegistry,
     MetricRegistryStatus,
+    MetricSample,
 )
 
 __all__ = [
@@ -54,6 +57,8 @@ __all__ = [
     "default_redaction_policy",
     "Counter",
     "Gauge",
+    "Histogram",
+    "HistogramPoint",
     "InMemoryMetricRegistry",
     "MetricDescriptor",
     "MetricInstrument",
@@ -61,5 +66,6 @@ __all__ = [
     "MetricLabelSet",
     "MetricPoint",
     "MetricRegistry",
+    "MetricSample",
     "MetricRegistryStatus",
 ]
