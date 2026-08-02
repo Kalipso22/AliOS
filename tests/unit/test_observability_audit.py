@@ -3,8 +3,8 @@ import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
-from enum import Enum
-from typing import cast
+from enum import Enum, IntEnum, IntFlag, StrEnum
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -58,6 +58,21 @@ def _record() -> AuditRecord:
         TraceSource("unit"),
         "Read resource",
     )
+
+
+def _created_record(**overrides: Any) -> AuditRecord:
+    values: dict[str, Any] = {
+        "category": AuditCategory.SYSTEM,
+        "severity": AuditSeverity.INFO,
+        "outcome": AuditOutcome.SUCCESS,
+        "actor": _actor(),
+        "action": AuditAction("run"),
+        "source": TraceSource("unit"),
+        "summary": "run",
+        "occurred_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return AuditRecord.create(**values)
 
 
 def _safe_policy() -> RedactionPolicy:
@@ -1255,3 +1270,224 @@ def test_audit_record_integrity_digest_changes_with_context() -> None:
 def test_audit_record_integrity_digest_changes_with_reason_code() -> None:
     record = _record()
     assert record.integrity_digest() != replace(record, reason_code="denied").integrity_digest()
+
+
+def test_audit_data_rejects_int_enum() -> None:
+    class Number(IntEnum):
+        ONE = 1
+
+    with pytest.raises(AuditSerializationError):
+        AuditAction("read", {"value": Number.ONE})
+
+
+def test_audit_data_rejects_int_flag() -> None:
+    class Permission(IntFlag):
+        READ = 1
+
+    with pytest.raises(AuditSerializationError):
+        AuditAction("read", {"value": Permission.READ})
+
+
+def test_audit_data_still_accepts_plain_integer() -> None:
+    assert AuditAction("read", {"value": 1}).attributes["value"] == 1
+
+
+def test_audit_data_still_normalizes_str_enum() -> None:
+    class Label(StrEnum):
+        SAFE = "safe"
+
+    assert AuditAction("read", {"value": Label.SAFE}).attributes["value"] == "safe"
+
+
+def test_audit_data_enum_error_omits_secret() -> None:
+    secret = "AUDIT-C2A1-STRICT-SECRET-2df84a"
+
+    class Secret(Enum):
+        VALUE = secret
+
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditAction("read", {"nested": [Secret.VALUE]})
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_context_from_trace_context_accepts_none_metadata() -> None:
+    assert AuditContext.from_trace_context(TraceContext.create_root(), metadata=None).metadata == {}
+
+
+def test_audit_context_from_trace_context_accepts_empty_mapping() -> None:
+    metadata: dict[str, object] = {}
+    context = AuditContext.from_trace_context(TraceContext.create_root(), metadata=metadata)
+    assert context.metadata == {} and context.metadata is not metadata
+
+
+def test_audit_context_from_trace_context_rejects_empty_list_metadata() -> None:
+    with pytest.raises(AuditContextError):
+        AuditContext.from_trace_context(TraceContext.create_root(), metadata=cast(Any, []))
+
+
+def test_audit_context_from_trace_context_rejects_empty_tuple_metadata() -> None:
+    with pytest.raises(AuditContextError):
+        AuditContext.from_trace_context(TraceContext.create_root(), metadata=cast(Any, ()))
+
+
+def test_audit_context_from_trace_context_rejects_empty_string_metadata() -> None:
+    with pytest.raises(AuditContextError):
+        AuditContext.from_trace_context(TraceContext.create_root(), metadata=cast(Any, ""))
+
+
+def test_audit_context_from_trace_context_rejects_false_metadata() -> None:
+    with pytest.raises(AuditContextError):
+        AuditContext.from_trace_context(TraceContext.create_root(), metadata=cast(Any, False))
+
+
+def test_audit_context_from_trace_context_failure_preserves_bound_context() -> None:
+    bound = AuditContext(run_id=RunId())
+    with bind_audit_context(bound):
+        with pytest.raises(AuditContextError):
+            AuditContext.from_trace_context(TraceContext.create_root(), metadata=cast(Any, []))
+        assert current_audit_context() is bound
+    assert current_audit_context() is None
+
+
+def test_audit_context_from_trace_context_secret_failure_is_safe() -> None:
+    secret = "AUDIT-C2A1-STRICT-SECRET-2df84a"
+
+    class Secret(Enum):
+        VALUE = secret
+
+    with pytest.raises(AuditContextError) as captured:
+        AuditContext.from_trace_context(
+            TraceContext.create_root(), metadata={"nested": [Secret.VALUE]}
+        )
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_record_create_none_id_generates_identifier() -> None:
+    assert type(_created_record(record_id=None).record_id) is AuditRecordId
+
+
+def test_audit_record_create_preserves_explicit_identifier() -> None:
+    identifier = AuditRecordId()
+    assert _created_record(record_id=identifier).record_id is identifier
+
+
+def test_audit_record_create_rejects_zero_record_id() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(record_id=0)
+
+
+def test_audit_record_create_rejects_false_record_id() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(record_id=False)
+
+
+def test_audit_record_create_rejects_empty_string_record_id() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(record_id="")
+
+
+def test_audit_record_create_rejects_empty_list_record_id() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(record_id=[])
+
+
+def test_audit_record_create_accepts_none_attributes() -> None:
+    assert _created_record(attributes=None).attributes == {}
+
+
+def test_audit_record_create_accepts_empty_mapping_attributes() -> None:
+    attributes: dict[str, object] = {}
+    record = _created_record(attributes=attributes)
+    assert record.attributes == {} and record.attributes is not attributes
+
+
+def test_audit_record_create_rejects_empty_list_attributes() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(attributes=[])
+
+
+def test_audit_record_create_rejects_empty_tuple_attributes() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(attributes=())
+
+
+def test_audit_record_create_rejects_empty_string_attributes() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(attributes="")
+
+
+def test_audit_record_create_rejects_false_attributes() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(attributes=False)
+
+
+def test_audit_record_create_attribute_failure_preserves_bound_context() -> None:
+    bound = AuditContext(run_id=RunId())
+    with bind_audit_context(bound):
+        with pytest.raises(AuditValidationError):
+            _created_record(attributes=[])
+        assert current_audit_context() is bound
+
+
+def test_audit_record_create_attribute_failure_skips_explicit_clock() -> None:
+    with pytest.raises(AuditValidationError):
+        _created_record(
+            attributes=[],
+            clock=lambda: (_ for _ in ()).throw(AssertionError("clock called")),
+        )
+
+
+def test_audit_record_create_attribute_error_omits_secret() -> None:
+    secret = "AUDIT-C2A1-STRICT-SECRET-2df84a"
+
+    class Secret(Enum):
+        VALUE = secret
+
+    with pytest.raises(AuditSerializationError) as captured:
+        _created_record(attributes={"nested": [Secret.VALUE]})
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())
+
+
+def test_audit_record_from_dict_accepts_unique_list_tags() -> None:
+    value = _record().to_dict(_safe_policy())
+    value["tags"] = ["security", "access"]
+    assert AuditRecord.from_dict(value).tags == frozenset({"security", "access"})
+
+
+def test_audit_record_from_dict_accepts_unique_tuple_tags() -> None:
+    value = cast(dict[str, object], _record().to_dict(_safe_policy()))
+    value["tags"] = ("security", "access")
+    assert AuditRecord.from_dict(value).tags == frozenset({"security", "access"})
+
+
+def test_audit_record_from_dict_rejects_duplicate_list_tags() -> None:
+    value = _record().to_dict(_safe_policy())
+    value["tags"] = ["security", "security"]
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditRecord.from_dict(value)
+    assert isinstance(captured.value.__cause__, AuditValidationError)
+
+
+def test_audit_record_from_dict_rejects_duplicate_tuple_tags() -> None:
+    value = cast(dict[str, object], _record().to_dict(_safe_policy()))
+    value["tags"] = ("security", "security")
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditRecord.from_dict(value)
+    assert isinstance(captured.value.__cause__, AuditValidationError)
+
+
+def test_audit_record_duplicate_tag_error_omits_values() -> None:
+    secret = "AUDIT-C2A1-STRICT-SECRET-2df84a"
+    value = _record().to_dict(_safe_policy())
+    value["tags"] = [secret, secret]
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditRecord.from_dict(value)
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+    assert secret not in str(captured.value.to_dict())

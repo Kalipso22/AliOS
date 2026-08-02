@@ -16,7 +16,7 @@ from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from types import MappingProxyType
 from typing import Self, cast
 
@@ -102,6 +102,8 @@ def _normalize(
         )
     if isinstance(value, StrEnum):
         return value.value
+    if isinstance(value, Enum):
+        raise AuditSerializationError("Audit data type is unsupported")
     if isinstance(value, Identifier):
         return str(value)
     if isinstance(value, datetime):
@@ -406,16 +408,21 @@ class AuditContext:
     ) -> Self:
         if not isinstance(trace_context, TraceContext):
             raise AuditContextError("Invalid trace context")
-        return cls(
-            trace_context.correlation_id,
-            trace_context.run_id,
-            trace_context.tenant_id,
-            trace_context.user_id,
-            trace_context.trace_id,
-            trace_context.span_id,
-            trace_context.parent_span_id,
-            metadata or {},
-        )
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise AuditContextError("Invalid audit context metadata")
+        try:
+            return cls(
+                trace_context.correlation_id,
+                trace_context.run_id,
+                trace_context.tenant_id,
+                trace_context.user_id,
+                trace_context.trace_id,
+                trace_context.span_id,
+                trace_context.parent_span_id,
+                {} if metadata is None else metadata,
+            )
+        except (AuditValidationError, AuditSerializationError) as error:
+            raise AuditContextError("Invalid audit context metadata", cause=error) from error
 
     def with_metadata(self, values: Mapping[str, object] | None = None, **kwargs: object) -> Self:
         if values is not None and not isinstance(values, Mapping):
@@ -601,7 +608,7 @@ class AuditRecord:
             context if context is not None else (current_audit_context() or AuditContext())
         )
         return cls(
-            record_id or AuditRecordId(),
+            record_id if record_id is not None else AuditRecordId(),
             timestamp,
             category,
             severity,
@@ -613,7 +620,7 @@ class AuditRecord:
             resolved_context,
             target,
             reason_code,
-            attributes or {},
+            {} if attributes is None else attributes,
             cast(frozenset[str], tags),
         )
 
@@ -677,7 +684,7 @@ class AuditRecord:
                 else None,
                 cast(str | None, value.get("reason_code")),
                 cast(Mapping[str, object], value.get("attributes", {})),
-                frozenset(cast(list[str] | tuple[str, ...], tags)),
+                cast(frozenset[str], tags),
             )
         except (
             TypeError,
@@ -701,8 +708,10 @@ class AuditRecord:
             "actor": {
                 "kind": self.actor.kind.value,
                 "identifier": self.actor.identifier,
-                "tenant_id": str(self.actor.tenant_id) if self.actor.tenant_id else None,
-                "user_id": str(self.actor.user_id) if self.actor.user_id else None,
+                "tenant_id": str(self.actor.tenant_id)
+                if self.actor.tenant_id is not None
+                else None,
+                "user_id": str(self.actor.user_id) if self.actor.user_id is not None else None,
                 "attributes": _thaw(self.actor.attributes),
             },
             "action": {"name": self.action.name, "attributes": _thaw(self.action.attributes)},
@@ -730,7 +739,7 @@ class AuditRecord:
                 "identifier": self.target.identifier,
                 "attributes": _thaw(self.target.attributes),
             }
-            if self.target
+            if self.target is not None
             else None,
             "reason_code": self.reason_code,
             "attributes": _thaw(self.attributes),

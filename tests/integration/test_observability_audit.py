@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 from alios_core import RunId
+from alios_core.errors import AuditContextError, AuditSerializationError, AuditValidationError
 from alios_observability import (
     AuditAction,
     AuditActor,
@@ -296,3 +297,79 @@ def test_public_audit_exports_preserve_audit_class_identity() -> None:
     import alios_observability.audit as audit
 
     assert alios_observability.AuditRecord is audit.AuditRecord
+
+
+def test_trace_to_audit_context_rejects_falsey_non_mapping_metadata() -> None:
+    trace = TraceContext.create_root()
+    invalid_values: tuple[object, ...] = ([], (), "", 0, False)
+    for invalid in invalid_values:
+        with pytest.raises(AuditContextError):
+            AuditContext.from_trace_context(trace, metadata=invalid)  # type: ignore[arg-type]
+
+
+def test_trace_to_audit_context_failure_does_not_change_bound_context() -> None:
+    bound = AuditContext(run_id=RunId())
+    with bind_audit_context(bound):
+        with pytest.raises(AuditContextError):
+            AuditContext.from_trace_context(TraceContext.create_root(), metadata=False)  # type: ignore[arg-type]
+        assert current_audit_context() is bound
+
+
+def test_audit_record_factory_rejects_falsey_invalid_attributes() -> None:
+    invalid_values: tuple[object, ...] = ([], (), "", 0, False)
+    for invalid in invalid_values:
+        with pytest.raises(AuditValidationError):
+            _record_with(attributes=invalid)
+
+
+def test_audit_record_factory_invalid_id_does_not_change_bound_context() -> None:
+    bound = AuditContext(run_id=RunId())
+    with bind_audit_context(bound):
+        with pytest.raises(AuditValidationError):
+            _record_with(record_id=False)
+        assert current_audit_context() is bound
+
+
+def test_audit_record_duplicate_serialized_tags_rejected_after_round_trip_mutation() -> None:
+    serialized = _record().to_dict(RedactionPolicy(include_default_rules=False))
+    serialized["tags"] = ["security", "security"]
+    with pytest.raises(AuditSerializationError) as captured:
+        AuditRecord.from_dict(serialized)
+    assert isinstance(captured.value.__cause__, AuditValidationError)
+
+
+def test_audit_record_unique_serialized_tags_round_trip() -> None:
+    record = replace(_record(), tags=frozenset({"security", "access"}))
+    serialized = record.to_dict(RedactionPolicy(include_default_rules=False))
+    assert serialized["tags"] == ["access", "security"]
+    assert AuditRecord.from_dict(serialized) == record
+
+
+def test_audit_record_strict_factory_failures_create_no_global_state() -> None:
+    assert current_audit_context() is None
+    with pytest.raises(AuditValidationError):
+        _record_with(attributes=[])
+    assert current_audit_context() is None
+
+
+def test_audit_record_strict_factory_failures_do_not_affect_integrity_digest() -> None:
+    record = _record()
+    digest = record.integrity_digest()
+    with pytest.raises(AuditValidationError):
+        _record_with(record_id=0)
+    assert record.integrity_digest() == digest
+
+
+def _record_with(**overrides: object) -> AuditRecord:
+    values: dict[str, object] = {
+        "category": AuditCategory.SECURITY,
+        "severity": AuditSeverity.NOTICE,
+        "outcome": AuditOutcome.SUCCESS,
+        "actor": AuditActor(AuditActorKind.USER, "user"),
+        "action": AuditAction("read"),
+        "source": TraceSource("integration"),
+        "summary": "Read",
+        "occurred_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return AuditRecord.create(**values)  # type: ignore[arg-type]
