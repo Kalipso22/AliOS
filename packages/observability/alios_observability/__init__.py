@@ -20,6 +20,18 @@ from .logging import (
     current_log_context,
     default_redaction_policy,
 )
+from .metrics import (
+    Counter,
+    Gauge,
+    InMemoryMetricRegistry,
+    MetricDescriptor,
+    MetricInstrument,
+    MetricKind,
+    MetricLabelSet,
+    MetricPoint,
+    MetricRegistry,
+    MetricRegistryStatus,
+)
 
 __all__ = [
     "InMemoryLogSink",
@@ -40,4 +52,14 @@ __all__ = [
     "bind_log_context",
     "current_log_context",
     "default_redaction_policy",
+    "Counter",
+    "Gauge",
+    "InMemoryMetricRegistry",
+    "MetricDescriptor",
+    "MetricInstrument",
+    "MetricKind",
+    "MetricLabelSet",
+    "MetricPoint",
+    "MetricRegistry",
+    "MetricRegistryStatus",
 ]

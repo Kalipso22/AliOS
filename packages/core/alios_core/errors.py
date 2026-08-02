@@ -126,3 +126,23 @@ class LogSerializationError(LoggingError):
 
 class LogSinkError(LoggingError):
     code = "log_sink_error"
+
+
+class MetricsError(ObservabilityError):
+    code = "metrics_error"
+
+
+class MetricDefinitionError(MetricsError):
+    code = "metric_definition_error"
+
+
+class MetricValueError(MetricsError):
+    code = "metric_value_error"
+
+
+class MetricCardinalityError(MetricsError):
+    code = "metric_cardinality_error"
+
+
+class MetricRegistryClosedError(MetricsError):
+    code = "metric_registry_closed"
