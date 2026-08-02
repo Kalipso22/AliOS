@@ -7,7 +7,14 @@ from typing import cast
 
 import pytest
 from alios_core import TraceId
-from alios_core.errors import SpanCompletionError, TracerClosedError, ValidationError
+from alios_core.errors import (
+    SpanCompletionError,
+    SpanLimitError,
+    SpanValidationError,
+    TracerClosedError,
+    TraceSerializationError,
+    ValidationError,
+)
 from alios_observability import (
     AlwaysOffSampler,
     AlwaysOnSampler,
@@ -17,8 +24,10 @@ from alios_observability import (
     ParentBasedSampler,
     RedactionPolicy,
     RedactionRule,
+    SamplingRequest,
     SpanEvent,
     SpanKind,
+    SpanLimits,
     SpanLink,
     SpanRecord,
     SpanStatus,
@@ -635,3 +644,121 @@ async def test_tracer_import_creates_no_global_tasks() -> None:
     await asyncio.sleep(0)
     after = {task for task in asyncio.all_tasks() if task is not current and not task.done()}
     assert module is sys.modules["alios_observability.tracing"] and after == before
+
+
+@pytest.mark.asyncio
+async def test_drop_tracer_accepts_payload_above_recording_limits() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    span = await tracer.start_span("drop", attributes={"one": 1, "two": 2})
+    assert not span.is_recording
+
+
+@pytest.mark.asyncio
+async def test_drop_tracer_large_payload_propagates_context() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    parent = TraceContext.create_root()
+    span = await tracer.start_span("drop", parent=parent, attributes={"one": 1, "two": 2})
+    assert span.context.trace_id == parent.trace_id and not span.context.sampled
+
+
+@pytest.mark.asyncio
+async def test_drop_tracer_large_payload_produces_no_record() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    assert await (await tracer.start_span("drop", attributes={"one": 1, "two": 2})).end() is None
+
+
+@pytest.mark.asyncio
+async def test_drop_tracer_large_payload_status_lifecycle() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    span = await tracer.start_span("drop", attributes={"one": 1, "two": 2})
+    assert (await tracer.status()).active_count == 1
+    await span.end()
+    assert (await tracer.status()).active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_record_only_tracer_rejects_payload_above_limits() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysRecordSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("record", attributes={"one": 1, "two": 2})
+
+
+@pytest.mark.asyncio
+async def test_always_on_tracer_rejects_payload_above_limits() -> None:
+    tracer = DefaultTracer(
+        TraceSource("integration"), sampler=AlwaysOnSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("sample", attributes={"one": 1, "two": 2})
+
+
+@pytest.mark.asyncio
+async def test_normalized_attribute_collision_rejected_through_tracer() -> None:
+    with pytest.raises(SpanValidationError):
+        await DefaultTracer(TraceSource("integration")).start_span(
+            "work", attributes={"method": "GET", " method ": "POST"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_normalized_attribute_collision_leaves_tracer_usable() -> None:
+    tracer = DefaultTracer(TraceSource("integration"))
+    with pytest.raises(SpanValidationError):
+        await tracer.start_span("bad", attributes={"method": "GET", " method ": "POST"})
+    assert (await tracer.start_span("good")).is_recording
+
+
+@pytest.mark.asyncio
+async def test_non_recording_event_uses_registry_clock_equivalent_tracer_clock() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now, now]
+    tracer = DefaultTracer(TraceSource("integration"), sampler=AlwaysOffSampler(), clock=values.pop)
+    assert await (await tracer.start_span("drop")).add_event("event") is None and not values
+
+
+@pytest.mark.asyncio
+async def test_non_recording_event_clock_failure_preserves_active_span() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now]
+
+    def clock() -> datetime:
+        if values:
+            return values.pop()
+        raise RuntimeError("clock failure")
+
+    tracer = DefaultTracer(TraceSource("integration"), sampler=AlwaysOffSampler(), clock=clock)
+    span = await tracer.start_span("drop")
+    with pytest.raises(RuntimeError):
+        await span.add_event("event")
+    assert not span.is_ended and (await tracer.status()).active_count == 1
+
+
+def test_sampling_request_explicit_parent_round_trip() -> None:
+    parent = TraceContext.create_root()
+    request = SamplingRequest(
+        TraceId(), parent, "work", TraceSource("integration"), SpanKind.INTERNAL
+    )
+    assert (
+        SamplingRequest.from_dict(request.to_dict(RedactionPolicy(include_default_rules=False)))
+        == request
+    )
+
+
+def test_sampling_request_empty_parent_payload_rejected() -> None:
+    request = SamplingRequest(
+        TraceId(), None, "work", TraceSource("integration"), SpanKind.INTERNAL
+    )
+    rendered = request.to_dict()
+    cast(dict[str, object], rendered)["parent_context"] = {}
+    with pytest.raises(TraceSerializationError):
+        SamplingRequest.from_dict(rendered)

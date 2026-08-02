@@ -1665,3 +1665,246 @@ def test_trace_text_rejects_delete_control_character() -> None:
 def test_trace_baggage_rejects_delete_control_character() -> None:
     with pytest.raises(TraceContextError):
         TraceContext.create_root(baggage={"key": "bad\x7f"})
+
+
+def test_sampling_request_from_dict_accepts_none_parent() -> None:
+    request = SamplingRequest(TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL)
+    rendered = request.to_dict(RedactionPolicy(include_default_rules=False))
+    assert SamplingRequest.from_dict(rendered).parent_context is None
+
+
+def test_sampling_request_from_dict_restores_explicit_parent() -> None:
+    parent = TraceContext.create_root()
+    request = SamplingRequest(TraceId(), parent, "work", TraceSource("test"), SpanKind.INTERNAL)
+    rendered = request.to_dict(RedactionPolicy(include_default_rules=False))
+    assert SamplingRequest.from_dict(rendered).parent_context == parent
+
+
+def test_sampling_request_from_dict_rejects_empty_parent_mapping() -> None:
+    rendered = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL
+    ).to_dict()
+    cast(dict[str, object], rendered)["parent_context"] = {}
+    with pytest.raises(TraceSerializationError):
+        SamplingRequest.from_dict(rendered)
+
+
+def test_sampling_request_from_dict_rejects_malformed_parent_mapping() -> None:
+    rendered = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL
+    ).to_dict()
+    cast(dict[str, object], rendered)["parent_context"] = {"trace_id": "bad"}
+    with pytest.raises(TraceSerializationError):
+        SamplingRequest.from_dict(rendered)
+
+
+def test_sampling_request_from_dict_rejects_non_mapping_parent() -> None:
+    rendered = SamplingRequest(
+        TraceId(), None, "work", TraceSource("test"), SpanKind.INTERNAL
+    ).to_dict()
+    cast(dict[str, object], rendered)["parent_context"] = "parent"
+    with pytest.raises(TraceSerializationError):
+        SamplingRequest.from_dict(rendered)
+
+
+@pytest.mark.asyncio
+async def test_drop_span_allows_initial_attributes_above_recording_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    assert not (await tracer.start_span("drop", attributes={"first": 1, "second": 2})).is_recording
+
+
+@pytest.mark.asyncio
+async def test_drop_span_allows_initial_links_above_recording_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    links = (SpanLink(TraceContext.create_root()), SpanLink(TraceContext.create_root()))
+    assert not (await tracer.start_span("drop", links=links)).is_recording
+
+
+@pytest.mark.asyncio
+async def test_drop_span_above_limits_updates_started_and_dropped_counts() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOffSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    span = await tracer.start_span("drop", attributes={"first": 1, "second": 2})
+    before_end = await tracer.status()
+    await span.end()
+    assert (before_end.started_count, before_end.dropped_count, before_end.active_count) == (
+        1,
+        1,
+        1,
+    )
+    assert (await tracer.status()).active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_drop_span_above_limits_does_not_invoke_handler() -> None:
+    class Handler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def on_end(self, record: SpanRecord) -> None:
+            self.calls += 1
+
+    handler = Handler()
+    tracer = DefaultTracer(
+        TraceSource("test"),
+        sampler=AlwaysOffSampler(),
+        end_handler=handler,
+        limits=SpanLimits(1, 1, 1),
+    )
+    await (await tracer.start_span("drop", attributes={"first": 1, "second": 2})).end()
+    assert handler.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_record_only_span_enforces_initial_attribute_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysRecordSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("record", attributes={"first": 1, "second": 2})
+
+
+@pytest.mark.asyncio
+async def test_record_only_span_enforces_initial_link_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysRecordSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    links = (SpanLink(TraceContext.create_root()), SpanLink(TraceContext.create_root()))
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("record", links=links)
+
+
+@pytest.mark.asyncio
+async def test_sampled_span_enforces_initial_attribute_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOnSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("sample", attributes={"first": 1, "second": 2})
+
+
+@pytest.mark.asyncio
+async def test_sampled_span_enforces_initial_link_limit() -> None:
+    tracer = DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOnSampler(), limits=SpanLimits(1, 1, 1)
+    )
+    links = (SpanLink(TraceContext.create_root()), SpanLink(TraceContext.create_root()))
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("sample", links=links)
+
+
+@pytest.mark.asyncio
+async def test_recording_limit_failure_does_not_change_tracer_status() -> None:
+    tracer = DefaultTracer(TraceSource("test"), limits=SpanLimits(1, 1, 1))
+    with pytest.raises(SpanLimitError):
+        await tracer.start_span("sample", attributes={"first": 1, "second": 2})
+    assert (await tracer.status()).started_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recording_span_set_attributes_rejects_normalized_name_collision() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work")
+    with pytest.raises(SpanValidationError):
+        await span.set_attributes({"method": "GET", " method ": "POST"})
+
+
+@pytest.mark.asyncio
+async def test_recording_span_collision_failure_is_atomic() -> None:
+    span = await DefaultTracer(TraceSource("test")).start_span("work", attributes={"region": "eu"})
+    with pytest.raises(SpanValidationError):
+        await span.set_attributes({"method": "GET", " method ": "POST"})
+    assert cast(SpanRecord, await span.end()).attributes == {"region": "eu"}
+
+
+@pytest.mark.asyncio
+async def test_tracer_initial_attributes_reject_normalized_name_collision() -> None:
+    with pytest.raises(SpanValidationError):
+        await DefaultTracer(TraceSource("test")).start_span(
+            "work", attributes={"method": "GET", " method ": "POST"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_tracer_initial_attribute_collision_does_not_change_status() -> None:
+    tracer = DefaultTracer(TraceSource("test"))
+    with pytest.raises(SpanValidationError):
+        await tracer.start_span("work", attributes={"method": "GET", " method ": "POST"})
+    assert (await tracer.status()).started_count == 0
+
+
+def test_sampler_attributes_may_override_initial_attributes() -> None:
+    result = SamplingResult(SamplingDecision.RECORD_AND_SAMPLE, {"method": "POST"})
+    assert {**{"method": "GET"}, **result.attributes}["method"] == "POST"
+
+
+def test_sampler_attribute_mapping_rejects_internal_normalized_collision() -> None:
+    with pytest.raises(SpanValidationError):
+        SamplingResult(SamplingDecision.RECORD_AND_SAMPLE, {"method": "GET", " method ": "POST"})
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_add_event_uses_injected_clock() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now, now]
+    tracer = DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler(), clock=values.pop)
+    span = await tracer.start_span("drop")
+    assert await span.add_event("event") is None and not values
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_add_event_explicit_timestamp_skips_clock() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now]
+    tracer = DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler(), clock=values.pop)
+    span = await tracer.start_span("drop")
+    assert await span.add_event("event", timestamp=now) is None and not values
+
+
+@pytest.mark.asyncio
+async def test_non_recording_span_add_event_rejects_naive_injected_clock() -> None:
+    aware = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [datetime(2026, 1, 1), aware, aware]
+    tracer = DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler(), clock=values.pop)
+    span = await tracer.start_span("drop")
+    with pytest.raises(SpanValidationError):
+        await span.add_event("event")
+
+
+@pytest.mark.asyncio
+async def test_non_recording_event_clock_failure_does_not_end_span() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now]
+
+    def clock() -> datetime:
+        if values:
+            return values.pop()
+        raise RuntimeError("clock failure")
+
+    span = await DefaultTracer(
+        TraceSource("test"), sampler=AlwaysOffSampler(), clock=clock
+    ).start_span("drop")
+    with pytest.raises(RuntimeError):
+        await span.add_event("event")
+    assert not span.is_ended
+
+
+@pytest.mark.asyncio
+async def test_non_recording_event_clock_failure_does_not_change_tracer_status() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    values = [now, now]
+
+    def clock() -> datetime:
+        if values:
+            return values.pop()
+        raise RuntimeError("clock failure")
+
+    tracer = DefaultTracer(TraceSource("test"), sampler=AlwaysOffSampler(), clock=clock)
+    span = await tracer.start_span("drop")
+    with pytest.raises(RuntimeError):
+        await span.add_event("event")
+    assert (await tracer.status()).active_count == 1

@@ -726,7 +726,9 @@ class SamplingRequest:
                 raise ValueError
             return cls(
                 TraceId(cast(str, value["trace_id"])),
-                TraceContext.from_dict(cast(Mapping[str, object], parent)) if parent else None,
+                TraceContext.from_dict(cast(Mapping[str, object], parent))
+                if parent is not None
+                else None,
                 cast(str, value["name"]),
                 TraceSource.from_dict(cast(Mapping[str, object], value["source"])),
                 SpanKind.parse(cast(str, value["kind"])),
@@ -751,7 +753,7 @@ class SamplingResult:
     def __post_init__(self) -> None:
         if not isinstance(self.decision, SamplingDecision):
             raise SamplingError("Invalid sampling result")
-        object.__setattr__(self, "attributes", _attributes(self.attributes))
+        object.__setattr__(self, "attributes", _normalize_span_attributes(self.attributes))
 
     @property
     def is_recording(self) -> bool:
@@ -936,6 +938,18 @@ def _attribute_name(value: object) -> str:
     return result
 
 
+def _normalize_span_attributes(values: Mapping[str, object]) -> Mapping[str, object]:
+    if not isinstance(values, Mapping):
+        raise SpanValidationError("Invalid span attributes")
+    normalized: dict[str, object] = {}
+    for raw_name, value in values.items():
+        name = _attribute_name(raw_name)
+        if name in normalized:
+            raise SpanValidationError("Duplicate span attribute name")
+        normalized[name] = value
+    return _attributes(normalized)
+
+
 def _process_control(error: BaseException) -> bool:
     return isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit))
 
@@ -1079,10 +1093,7 @@ class RecordingSpan:
             self._attributes[key] = normalized
 
     async def set_attributes(self, values: Mapping[str, object]) -> None:
-        if not isinstance(values, Mapping):
-            raise SpanValidationError("Invalid span attributes")
-        normalized = {_attribute_name(name): value for name, value in values.items()}
-        safe = dict(_attributes(normalized))
+        safe = dict(_normalize_span_attributes(values))
         async with self._lock:
             self._require_active()
             added = sum(name not in self._attributes for name in safe)
@@ -1215,6 +1226,7 @@ class NonRecordingSpan:
         source: TraceSource,
         kind: SpanKind,
         started_at: datetime,
+        clock: Callable[[], datetime],
         completion_callback: Callable[[], Awaitable[None]],
     ) -> None:
         self._context = context
@@ -1223,6 +1235,7 @@ class NonRecordingSpan:
         self._source = source
         self._kind = kind
         self._started_at = started_at
+        self._clock = clock
         self._completion_callback = completion_callback
         self._ended = False
         self._lock = asyncio.Lock()
@@ -1282,7 +1295,7 @@ class NonRecordingSpan:
         attributes: Mapping[str, object] | None = None,
         timestamp: datetime | None = None,
     ) -> None:
-        SpanEvent(name, _aware(utc_now() if timestamp is None else timestamp), attributes or {})
+        SpanEvent(name, _aware(self._clock() if timestamp is None else timestamp), attributes or {})
         await self._active()
         return None
 
@@ -1510,7 +1523,9 @@ class DefaultTracer:
         if resolved_parent is not None and active_span_id == resolved_parent.span_id:
             raise TraceContextError("Child span cannot equal parent span")
         start = _aware(self._clock() if started_at is None else started_at)
-        initial_attributes = attributes if attributes is not None else {}
+        initial_attributes = _normalize_span_attributes(
+            attributes if attributes is not None else {}
+        )
         request = SamplingRequest(
             active_trace_id, resolved_parent, name, self._source, kind, initial_attributes, links
         )
@@ -1525,10 +1540,11 @@ class DefaultTracer:
         if not isinstance(result, SamplingResult):
             raise SamplingError("Invalid sampling result")
         merged_attributes = {**request.attributes, **result.attributes}
-        if result.is_recording and len(merged_attributes) > self._limits.maximum_attributes:
-            raise SpanLimitError("Span attribute limit reached")
-        if len(request.links) > self._limits.maximum_links:
-            raise SpanLimitError("Span link limit reached")
+        if result.is_recording:
+            if len(merged_attributes) > self._limits.maximum_attributes:
+                raise SpanLimitError("Span attribute limit reached")
+            if len(request.links) > self._limits.maximum_links:
+                raise SpanLimitError("Span link limit reached")
         if resolved_parent is None:
             context = TraceContext.create_root(
                 trace_id=active_trace_id, span_id=active_span_id, sampled=result.is_sampled
@@ -1557,7 +1573,14 @@ class DefaultTracer:
             )
         else:
             span = NonRecordingSpan(
-                context, resolved_parent, request.name, self._source, kind, start, self._on_drop_end
+                context,
+                resolved_parent,
+                request.name,
+                self._source,
+                kind,
+                start,
+                self._clock,
+                self._on_drop_end,
             )
         async with self._lock:
             if self._closed:
