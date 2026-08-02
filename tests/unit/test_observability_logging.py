@@ -1,4 +1,9 @@
+import asyncio
+import json
+import math
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import pytest
 from alios_core.errors import (
@@ -8,11 +13,12 @@ from alios_core.errors import (
     ResourceNotFoundError,
     ValidationError,
 )
-from alios_core.ids import CorrelationId, LogRecordId, RunId, TenantId, UserId
+from alios_core.ids import CorrelationId, EventId, LogRecordId, RunId, TenantId, UserId
 from alios_observability import (
     InMemoryLogSink,
     LogContext,
     LogDropPolicy,
+    LogException,
     LogFilter,
     LogLevel,
     LogRecord,
@@ -24,6 +30,7 @@ from alios_observability import (
     StructuredLogger,
     bind_log_context,
     current_log_context,
+    default_redaction_policy,
 )
 
 
@@ -295,3 +302,211 @@ def test_snapshot_round_trip_and_validation(case: int) -> None:
         LogSinkSnapshot(11, 10, 0, 0, 0, False)
     with pytest.raises(LogSerializationError):
         LogSinkSnapshot.from_dict({"stored_count": 0})
+
+
+@pytest.mark.parametrize(
+    "value", [math.nan, math.inf, -math.inf, b"secret", bytearray(b"secret"), {"value"}]
+)
+def test_logging_normalization_rejects_unsafe_values(value: object) -> None:
+    with pytest.raises(LogSerializationError):
+        LogContext(attributes={"value": value})
+
+
+def test_logging_normalization_rejects_non_string_mapping_key() -> None:
+    with pytest.raises(LogSerializationError):
+        LogContext(attributes=cast(dict[str, object], {1: "value"}))
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "password=secret-value",
+        "api_key=secret-value",
+        "client_secret=secret-value",
+        "access_token=secret-value",
+        "refresh-token: secret-value",
+        "Authorization: Bearer secret-value",
+        "Bearer secret-value",
+        "cookie=session-secret",
+        "session_id=secret-value",
+        "private_key=secret-value",
+        "-----BEGIN PRIVATE KEY-----",
+    ],
+)
+def test_default_redaction_masks_secret_message(keyword: str) -> None:
+    rendered = default_redaction_policy().redact(f"request {keyword}")
+    assert "secret-value" not in str(rendered)
+    assert "session-secret" not in str(rendered)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "token_count=8",
+        "password_policy=strong",
+        "authorization_result=ok",
+        "session_timeout=2",
+        "credential_type=oauth",
+    ],
+)
+def test_default_redaction_avoids_documented_false_positives(message: str) -> None:
+    assert default_redaction_policy().redact(message) == message
+
+
+def test_log_context_rejects_wrong_identifier_types() -> None:
+    with pytest.raises(ValidationError):
+        LogContext(run_id=CorrelationId())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        LogContext(parent_log_record_id=EventId())  # type: ignore[arg-type]
+
+
+def test_log_context_to_dict_deeply_thaws_attributes() -> None:
+    context = LogContext(attributes={"nested": {"values": ("one", {"two": 2})}})
+    first = context.to_dict()
+    second = context.to_dict()
+    assert first == second
+    assert isinstance(first["attributes"], dict)
+    assert json.dumps(first)
+    first["attributes"] = {"nested": {"values": ["one", {"two": 3}]}}
+    assert context.to_dict()["attributes"]["nested"]["values"][1]["two"] == 2  # type: ignore[index]
+
+
+def test_log_context_from_dict_rejects_malformed_values() -> None:
+    with pytest.raises(LogSerializationError):
+        LogContext.from_dict({"run_id": 1})
+    with pytest.raises(LogSerializationError):
+        LogContext.from_dict({"attributes": []})
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "matches"),
+    [
+        ("request.headers.authorization", ("request", "headers", "authorization"), True),
+        ("request.*.authorization", ("request", "headers", "authorization"), True),
+        ("request.headers.**", ("request", "headers"), True),
+        ("request.headers.**", ("request", "headers", "authorization"), True),
+        ("**", ("request", "headers", "authorization"), True),
+        ("request.*.authorization", ("request", "authorization"), False),
+    ],
+)
+def test_redaction_path_patterns(pattern: str, path: tuple[str, ...], matches: bool) -> None:
+    rule = RedactionRule("path", path_patterns=(pattern,))
+    assert rule.matches(None, path, "value") is matches
+
+
+def test_redaction_rule_round_trip_and_compiled_internals_are_private() -> None:
+    rule = RedactionRule("rule", value_patterns=("secret",))
+    restored = RedactionRule.from_dict(rule.to_dict())
+    assert restored == rule
+    assert "compiled" not in str(rule.to_dict())
+    assert rule._compiled_value_patterns is not restored._compiled_value_patterns
+
+
+@pytest.mark.parametrize(
+    "action, expected",
+    [
+        (RedactionAction.REMOVE, "[REMOVED]"),
+        (RedactionAction.MASK, "mask"),
+        (RedactionAction.HASH, "sha256:"),
+    ],
+)
+def test_redaction_actions_for_root_scalars(action: RedactionAction, expected: str) -> None:
+    value = RedactionPolicy(
+        (RedactionRule("rule", action=action, value_patterns=("secret",), replacement="mask"),),
+        include_default_rules=False,
+    ).redact("secret")
+    assert str(value).startswith(expected)
+
+
+@pytest.mark.parametrize(
+    "error", [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit(), GeneratorExit()]
+)
+def test_log_exception_process_control_errors_propagate(error: BaseException) -> None:
+    with pytest.raises(type(error)):
+        LogException.from_exception(error)
+
+
+def test_log_exception_round_trip_and_redaction() -> None:
+    exception = LogException("Example", "example", "password=secret", {"api_key": "secret"})
+    rendered = exception.to_dict()
+    assert "secret" not in str(rendered)
+    assert (
+        LogException.from_dict(exception.to_dict(RedactionPolicy(include_default_rules=False)))
+        == exception
+    )
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda: LogRecord(cast(LogLevel, "info"), "message", LogSource("unit")),
+        lambda: LogRecord(LogLevel.INFO, "message", cast(LogSource, "source")),
+        lambda: LogRecord(LogLevel.INFO, "message", LogSource("unit"), cast(LogContext, "context")),
+        lambda: LogRecord(LogLevel.INFO, "message", LogSource("unit"), sequence=True),
+        lambda: LogRecord(
+            LogLevel.INFO,
+            "message",
+            LogSource("unit"),
+            record_id=cast(LogRecordId, CorrelationId()),
+        ),
+    ],
+)
+def test_log_record_runtime_validation(builder: object) -> None:
+    with pytest.raises(ValidationError):
+        cast(Callable[[], LogRecord], builder)()
+
+
+def test_log_record_round_trip_preserves_exception() -> None:
+    record = _record("message", attributes={"nested": [1, 2]})
+    record = LogRecord(
+        record.level,
+        record.message,
+        record.source,
+        record.context,
+        record.attributes,
+        LogException("Error", "code", "safe"),
+        record.sequence,
+        record.record_id,
+        record.timestamp,
+    )
+    assert (
+        LogRecord.from_dict(record.to_dict(RedactionPolicy(include_default_rules=False))) == record
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"password": "one"},
+        {"api_key": "two"},
+        {"access_token": "three"},
+        {"refresh_token": "four"},
+        {"cookie": "five"},
+        {"private_key": "six"},
+        {"client_secret": "seven"},
+        {"authorization": "Bearer eight"},
+        {"nested": {"password": "nine"}},
+        {"items": [{"api_key": "ten"}]},
+        {"items": ({"cookie": "eleven"},)},
+        {"password": {"nested": "twelve"}},
+        {"api-key": "thirteen"},
+        {"refresh-token": "fourteen"},
+        {"client-secret": "fifteen"},
+        {"proxy_authorization": "sixteen"},
+        {"set_cookie": "seventeen"},
+        {"credential": "eighteen"},
+        {"session_id": "nineteen"},
+        {"secret": "twenty"},
+        {"passwd": "twenty-one"},
+        {"passphrase": "twenty-two"},
+        {"id_token": "twenty-three"},
+        {"credentials": "twenty-four"},
+        {"private-key": "twenty-five"},
+        {"access-token": "twenty-six"},
+        {"session": "twenty-seven"},
+        {"apikey": "twenty-eight"},
+    ],
+)
+def test_default_redaction_masks_sensitive_structured_values(payload: dict[str, object]) -> None:
+    rendered = default_redaction_policy().redact(payload)
+    assert "[REDACTED]" in str(rendered)

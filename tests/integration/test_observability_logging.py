@@ -54,3 +54,63 @@ async def test_closed_sink_keeps_historical_records_available(case: int) -> None
     assert await sink.get(record.record_id) == record
     assert await sink.count() == 1
     assert (await sink.snapshot()).closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location, secret",
+    [
+        ("message", "password=alpha"),
+        ("message", "api_key=bravo"),
+        ("message", "Authorization: Bearer charlie"),
+        ("message", "access_token=delta"),
+        ("message", "refresh_token=echo"),
+        ("message", "cookie=foxtrot"),
+        ("message", "private_key=golf"),
+        ("message", "client_secret=hotel"),
+        ("bound", "india"),
+        ("base_context", "juliet"),
+        ("base_attributes", "kilo"),
+        ("call_context", "lima"),
+        ("record_attributes", "mike"),
+        ("nested", "november"),
+        ("list", "oscar"),
+        ("tuple", "papa"),
+        ("details", "quebec"),
+        ("message", "Bearer romeo"),
+    ],
+)
+async def test_default_redaction_through_logger_never_leaks_secret(
+    location: str, secret: str
+) -> None:
+    sink = InMemoryLogSink()
+    bound = LogContext(attributes={"password": secret}) if location == "bound" else LogContext()
+    logger = StructuredLogger(
+        component="security",
+        sink=sink,
+        minimum_level=LogLevel.TRACE,
+        base_context=LogContext(attributes={"api_key": secret})
+        if location == "base_context"
+        else None,
+        base_attributes={"client_secret": secret} if location == "base_attributes" else None,
+    )
+    async with bind_log_context(bound):
+        record = await logger.info(
+            secret if location == "message" else "safe",
+            context=LogContext(attributes={"access_token": secret})
+            if location == "call_context"
+            else None,
+            attributes={"refresh_token": secret}
+            if location == "record_attributes"
+            else {"nested": {"cookie": secret}}
+            if location == "nested"
+            else {"items": [{"cookie": secret}]}
+            if location == "list"
+            else {"items": ({"cookie": secret},)}
+            if location == "tuple"
+            else None,
+        )
+    assert record is not None
+    rendered = record.to_dict()
+    assert secret not in str(rendered)
+    assert secret not in repr(rendered)

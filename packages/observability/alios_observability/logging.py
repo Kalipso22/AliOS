@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
@@ -17,6 +18,7 @@ from typing import Protocol, Self
 
 from alios_core.errors import (
     AliOSError,
+    LoggingError,
     LogSerializationError,
     LogSinkError,
     ResourceConflictError,
@@ -50,10 +52,22 @@ def _validate_text(value: str | None, field_name: str, *, required: bool = False
     return result
 
 
-def _normal(value: object, *, depth: int = 0, seen: set[int] | None = None) -> JsonValue:
-    if depth > 16:
+def _normal(
+    value: object,
+    *,
+    maximum_depth: int = 16,
+    maximum_items: int = 10_000,
+    depth: int = 0,
+    seen: set[int] | None = None,
+    consumed: list[int] | None = None,
+) -> JsonValue:
+    if depth > maximum_depth:
         raise LogSerializationError("Logging value nesting is too deep")
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise LogSerializationError("Logging value is not JSON-compatible")
         return value
     if isinstance(value, StrEnum):
         return value.value
@@ -64,17 +78,28 @@ def _normal(value: object, *, depth: int = 0, seen: set[int] | None = None) -> J
     if isinstance(value, _IDENTIFIERS):
         return str(value)
     visited = seen if seen is not None else set()
+    counter = consumed if consumed is not None else [0]
     if isinstance(value, Mapping):
         if id(value) in visited:
             raise LogSerializationError("Logging value contains a cycle")
         visited.add(id(value))
         try:
-            if len(value) > 10_000:
-                raise LogSerializationError("Logging mapping is too large")
-            return {
-                str(key): _normal(item, depth=depth + 1, seen=visited)
-                for key, item in value.items()
-            }
+            output: dict[str, JsonValue] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise LogSerializationError("Logging value is not JSON-compatible")
+                counter[0] += 1
+                if counter[0] > maximum_items:
+                    raise LogSerializationError("Logging value is too large")
+                output[key] = _normal(
+                    item,
+                    maximum_depth=maximum_depth,
+                    maximum_items=maximum_items,
+                    depth=depth + 1,
+                    seen=visited,
+                    consumed=counter,
+                )
+            return output
         finally:
             visited.remove(id(value))
     if isinstance(value, (list, tuple)):
@@ -82,9 +107,22 @@ def _normal(value: object, *, depth: int = 0, seen: set[int] | None = None) -> J
             raise LogSerializationError("Logging value contains a cycle")
         visited.add(id(value))
         try:
-            if len(value) > 10_000:
-                raise LogSerializationError("Logging sequence is too large")
-            return [_normal(item, depth=depth + 1, seen=visited) for item in value]
+            sequence_output: list[JsonValue] = []
+            for item in value:
+                counter[0] += 1
+                if counter[0] > maximum_items:
+                    raise LogSerializationError("Logging value is too large")
+                sequence_output.append(
+                    _normal(
+                        item,
+                        maximum_depth=maximum_depth,
+                        maximum_items=maximum_items,
+                        depth=depth + 1,
+                        seen=visited,
+                        consumed=counter,
+                    )
+                )
+            return sequence_output
         finally:
             visited.remove(id(value))
     raise LogSerializationError("Logging value is not JSON-compatible")
@@ -107,6 +145,8 @@ def _thaw(value: object) -> object:
 
 
 def _attributes(value: Mapping[str, object] | None) -> Mapping[str, object]:
+    if value is not None and not isinstance(value, Mapping):
+        raise LogSerializationError("Logging attributes must be a mapping")
     normalized = _normal(value or {})
     if not isinstance(normalized, dict):
         raise LogSerializationError("Logging attributes must be a mapping")
@@ -205,6 +245,18 @@ class LogContext:
     attributes: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        expected: tuple[tuple[object | None, type[object]], ...] = (
+            (self.correlation_id, CorrelationId),
+            (self.run_id, RunId),
+            (self.tenant_id, TenantId),
+            (self.user_id, UserId),
+            (self.task_id, TaskId),
+            (self.agent_id, AgentId),
+            (self.workflow_id, WorkflowId),
+            (self.parent_log_record_id, LogRecordId),
+        )
+        if any(value is not None and not isinstance(value, kind) for value, kind in expected):
+            raise ValidationError("Invalid log context identifier")
         object.__setattr__(self, "attributes", _attributes(self.attributes))
 
     def with_attributes(self, attributes: Mapping[str, object]) -> Self:
@@ -224,25 +276,45 @@ class LogContext:
         output: dict[str, object] = {
             name: str(item) if (item := getattr(self, name)) else None for name in fields
         }
-        output["attributes"] = dict(self.attributes)
+        output["attributes"] = _thaw(self.attributes)
         return output
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
+        if not isinstance(value, Mapping):
+            raise LogSerializationError("Invalid log context")
         attributes = value.get("attributes", {})
-        return cls(
-            CorrelationId(str(value["correlation_id"])) if value.get("correlation_id") else None,
-            RunId(str(value["run_id"])) if value.get("run_id") else None,
-            TenantId(str(value["tenant_id"])) if value.get("tenant_id") else None,
-            UserId(str(value["user_id"])) if value.get("user_id") else None,
-            TaskId(str(value["task_id"])) if value.get("task_id") else None,
-            AgentId(str(value["agent_id"])) if value.get("agent_id") else None,
-            WorkflowId(str(value["workflow_id"])) if value.get("workflow_id") else None,
-            LogRecordId(str(value["parent_log_record_id"]))
-            if value.get("parent_log_record_id")
-            else None,
-            attributes if isinstance(attributes, Mapping) else {},
-        )
+        if not isinstance(attributes, Mapping):
+            raise LogSerializationError("Invalid log context")
+
+        def raw_identifier(name: str) -> str | None:
+            raw = value.get(name)
+            if raw is not None and not isinstance(raw, str):
+                raise ValueError("invalid identifier")
+            return raw
+
+        try:
+            correlation_id = raw_identifier("correlation_id")
+            run_id = raw_identifier("run_id")
+            tenant_id = raw_identifier("tenant_id")
+            user_id = raw_identifier("user_id")
+            task_id = raw_identifier("task_id")
+            agent_id = raw_identifier("agent_id")
+            workflow_id = raw_identifier("workflow_id")
+            parent_record_id = raw_identifier("parent_log_record_id")
+            return cls(
+                CorrelationId(correlation_id) if correlation_id else None,
+                RunId(run_id) if run_id else None,
+                TenantId(tenant_id) if tenant_id else None,
+                UserId(user_id) if user_id else None,
+                TaskId(task_id) if task_id else None,
+                AgentId(agent_id) if agent_id else None,
+                WorkflowId(workflow_id) if workflow_id else None,
+                LogRecordId(parent_record_id) if parent_record_id else None,
+                attributes,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise LogSerializationError("Invalid log context") from error
 
 
 class _Binding(AbstractContextManager[None], AbstractAsyncContextManager[None]):
@@ -251,11 +323,14 @@ class _Binding(AbstractContextManager[None], AbstractAsyncContextManager[None]):
         self._token: Token[LogContext | None] | None = None
 
     def __enter__(self) -> None:
+        if self._token is not None:
+            raise LoggingError("Log context binding is already active")
         self._token = _CURRENT.set(self._context)
 
     def __exit__(self, *_: object) -> None:
         if self._token is not None:
             _CURRENT.reset(self._token)
+            self._token = None
 
     async def __aenter__(self) -> None:
         self.__enter__()
@@ -269,15 +344,15 @@ def current_log_context() -> LogContext | None:
 
 
 def bind_log_context(context: LogContext) -> _Binding:
+    if not isinstance(context, LogContext):
+        raise ValidationError("Invalid log context")
     return _Binding(context)
 
 
-def merge_current_log_context(context: LogContext | None) -> LogContext | None:
-    current = current_log_context()
-    if current is None:
-        return context
-    if context is None:
-        return current
+def _merge_log_contexts(*contexts: LogContext | None) -> LogContext | None:
+    selected = tuple(context for context in contexts if context is not None)
+    if not selected:
+        return None
     names = (
         "correlation_id",
         "run_id",
@@ -288,11 +363,27 @@ def merge_current_log_context(context: LogContext | None) -> LogContext | None:
         "workflow_id",
         "parent_log_record_id",
     )
-    identifiers = {name: getattr(context, name) or getattr(current, name) for name in names}
+    identifiers = {
+        name: next(
+            (
+                value
+                for context in reversed(selected)
+                if (value := getattr(context, name)) is not None
+            ),
+            None,
+        )
+        for name in names
+    }
     return LogContext(
         **identifiers,
-        attributes={**dict(current.attributes), **dict(context.attributes)},
+        attributes={
+            key: value for context in selected for key, value in context.attributes.items()
+        },
     )
+
+
+def merge_current_log_context(context: LogContext | None) -> LogContext | None:
+    return _merge_log_contexts(current_log_context(), context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,23 +395,52 @@ class RedactionRule:
     value_patterns: tuple[str, ...] = ()
     replacement: str = "[REDACTED]"
     case_sensitive: bool = False
+    _compiled_value_patterns: tuple[re.Pattern[str], ...] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _validate_text(self.name, "rule name", required=True))
-        object.__setattr__(
-            self, "keys", frozenset(item.strip() for item in self.keys if item.strip())
+        keys = frozenset(_validate_text(item, "redaction key", required=True) for item in self.keys)
+        paths = tuple(self._validate_path(pattern) for pattern in self.path_patterns)
+        patterns = tuple(
+            _validate_text(pattern, "redaction pattern", required=True)
+            for pattern in self.value_patterns
         )
-        object.__setattr__(self, "path_patterns", tuple(self.path_patterns))
-        object.__setattr__(self, "value_patterns", tuple(self.value_patterns))
+        object.__setattr__(self, "keys", keys)
+        object.__setattr__(self, "path_patterns", paths)
+        object.__setattr__(self, "value_patterns", patterns)
         if not (self.keys or self.path_patterns or self.value_patterns):
             raise ValidationError("Redaction rule requires a matcher")
-        if any(ord(item) < 32 for item in self.replacement):
+        if not isinstance(self.action, RedactionAction):
+            raise ValidationError("Invalid redaction action")
+        if not isinstance(self.case_sensitive, bool):
+            raise ValidationError("Invalid redaction case sensitivity")
+        replacement = _validate_text(self.replacement, "redaction replacement", required=True)
+        if replacement is None:
             raise ValidationError("Invalid redaction replacement")
+        object.__setattr__(self, "replacement", replacement)
         try:
-            for pattern in self.value_patterns:
-                re.compile(pattern)
+            flags = 0 if self.case_sensitive else re.IGNORECASE
+            object.__setattr__(
+                self,
+                "_compiled_value_patterns",
+                tuple(re.compile(pattern, flags) for pattern in patterns),
+            )
         except re.error as error:
             raise ValidationError("Invalid redaction pattern") from error
+
+    @staticmethod
+    def _validate_path(value: str) -> str:
+        text = _validate_text(value, "redaction path", required=True)
+        if text is None:
+            raise ValidationError("Invalid redaction path")
+        parts = tuple(part.strip() for part in text.split("."))
+        if any(not part or ("*" in part and part not in {"*", "**"}) for part in parts):
+            raise ValidationError("Invalid redaction path")
+        if "**" in parts[:-1]:
+            raise ValidationError("Invalid redaction path")
+        return ".".join(parts)
 
     def matches(self, key: str | None, path: tuple[str, ...], value: JsonValue) -> bool:
         normalize = (lambda item: item) if self.case_sensitive else str.lower
@@ -330,16 +450,17 @@ class RedactionRule:
             parts = pattern.split(".")
             if parts[-1:] == ["**"]:
                 if len(path) >= len(parts) - 1 and all(
-                    item == "*" or item == part
+                    item == "*" or normalize(item) == normalize(part)
                     for item, part in zip(parts[:-1], path, strict=False)
                 ):
                     return True
             elif len(parts) == len(path) and all(
-                item == "*" or item == part for item, part in zip(parts, path, strict=True)
+                item == "*" or normalize(item) == normalize(part)
+                for item, part in zip(parts, path, strict=True)
             ):
                 return True
         return isinstance(value, str) and any(
-            re.search(pattern, value) for pattern in self.value_patterns
+            pattern.search(value) for pattern in self._compiled_value_patterns
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -352,6 +473,50 @@ class RedactionRule:
             "replacement": self.replacement,
             "case_sensitive": self.case_sensitive,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            keys = value.get("keys", ())
+            paths = value.get("path_patterns", ())
+            patterns = value.get("value_patterns", ())
+            if any(
+                not isinstance(item, Sequence) or isinstance(item, str)
+                for item in (keys, paths, patterns)
+            ):
+                raise ValueError("invalid matchers")
+            if not isinstance(keys, Sequence) or isinstance(keys, str):
+                raise ValueError("invalid keys")
+            if not isinstance(paths, Sequence) or isinstance(paths, str):
+                raise ValueError("invalid paths")
+            if not isinstance(patterns, Sequence) or isinstance(patterns, str):
+                raise ValueError("invalid patterns")
+            if (
+                not isinstance(value.get("name"), str)
+                or not isinstance(value.get("replacement", "[REDACTED]"), str)
+                or not isinstance(value.get("case_sensitive", False), bool)
+            ):
+                raise ValueError("invalid rule")
+            name = value.get("name")
+            replacement = value.get("replacement", "[REDACTED]")
+            case_sensitive = value.get("case_sensitive", False)
+            if (
+                not isinstance(name, str)
+                or not isinstance(replacement, str)
+                or not isinstance(case_sensitive, bool)
+            ):
+                raise ValueError("invalid rule")
+            return cls(
+                name,
+                RedactionAction(str(value.get("action", RedactionAction.MASK))),
+                frozenset(str(item) for item in keys),
+                tuple(str(item) for item in paths),
+                tuple(str(item) for item in patterns),
+                replacement,
+                case_sensitive,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise LogSerializationError("Invalid redaction rule") from error
 
 
 _SENSITIVE_KEYS = frozenset(
@@ -383,6 +548,17 @@ _SENSITIVE_KEYS = frozenset(
     }
 )
 
+_SENSITIVE_VALUE_PATTERNS = (
+    r"\b(?:password|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?id|private[_-]?key|credential|cookie|set-cookie|proxy[_-]?authorization)\s*[:=]\s*(?:Bearer\s+)?\S+",
+    r"\bauthorization\s*[:=]\s*Bearer\s+\S+",
+    r"\bBearer\s+[-A-Za-z0-9._~+/=]+",
+    r"-----BEGIN (?:RSA )?PRIVATE KEY-----",
+)
+
+_DEFAULT_REDACTION_RULE = RedactionRule(
+    "default-sensitive", keys=_SENSITIVE_KEYS, value_patterns=_SENSITIVE_VALUE_PATTERNS
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RedactionPolicy:
@@ -395,19 +571,25 @@ class RedactionPolicy:
     def __post_init__(self) -> None:
         if min(self.maximum_depth, self.maximum_items, self.maximum_string_length) < 1:
             raise ValidationError("Invalid redaction limits")
-        object.__setattr__(self, "rules", tuple(self.rules))
+        rules = tuple(self.rules)
+        if not all(isinstance(rule, RedactionRule) for rule in rules) or not isinstance(
+            self.include_default_rules, bool
+        ):
+            raise ValidationError("Invalid redaction policy")
+        object.__setattr__(self, "rules", rules)
 
     def redact(self, value: object) -> JsonValue:
-        rules = (
-            (RedactionRule("default-sensitive", keys=_SENSITIVE_KEYS),)
-            if self.include_default_rules
-            else ()
-        ) + self.rules
+        rules = self.rules + ((_DEFAULT_REDACTION_RULE,) if self.include_default_rules else ())
+        normalized = _normal(
+            value, maximum_depth=self.maximum_depth, maximum_items=self.maximum_items
+        )
 
-        def render(item: object, path: tuple[str, ...], key: str | None, depth: int) -> JsonValue:
+        def render(
+            item: JsonValue, path: tuple[str, ...], key: str | None, depth: int
+        ) -> JsonValue:
             if depth > self.maximum_depth:
                 raise LogSerializationError("Logging value nesting is too deep")
-            normal = _normal(item)
+            normal = item
             rule = next(
                 (candidate for candidate in rules if candidate.matches(key, path, normal)), None
             )
@@ -440,11 +622,48 @@ class RedactionPolicy:
                 ]
             return normal[: self.maximum_string_length] if isinstance(normal, str) else normal
 
-        return render(value, (), None, 0)
+        return render(normalized, (), None, 0)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rules": [rule.to_dict() for rule in self.rules],
+            "include_default_rules": self.include_default_rules,
+            "maximum_depth": self.maximum_depth,
+            "maximum_items": self.maximum_items,
+            "maximum_string_length": self.maximum_string_length,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        rules = value.get("rules")
+        try:
+            if (
+                not isinstance(rules, Sequence)
+                or isinstance(rules, str)
+                or not isinstance(value.get("include_default_rules"), bool)
+            ):
+                raise ValueError("invalid policy")
+            if not all(isinstance(rule, Mapping) for rule in rules):
+                raise ValueError("invalid rule")
+            include_default_rules = value["include_default_rules"]
+            if not isinstance(include_default_rules, bool):
+                raise ValueError("invalid policy")
+            return cls(
+                tuple(RedactionRule.from_dict(rule) for rule in rules),
+                include_default_rules,
+                _integer(value["maximum_depth"]),
+                _integer(value["maximum_items"]),
+                _integer(value["maximum_string_length"]),
+            )
+        except (KeyError, TypeError, ValueError, ValidationError, LogSerializationError) as error:
+            raise LogSerializationError("Invalid redaction policy") from error
+
+
+_DEFAULT_REDACTION_POLICY = RedactionPolicy()
 
 
 def default_redaction_policy() -> RedactionPolicy:
-    return RedactionPolicy()
+    return _DEFAULT_REDACTION_POLICY
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,15 +675,38 @@ class LogException:
     retryable: bool = False
 
     def __post_init__(self) -> None:
+        for name, value, limit, newlines in (
+            ("error type", self.error_type, 256, False),
+            ("error code", self.error_code, 256, False),
+            ("error message", self.message, 4096, True),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value.strip()) > limit
+                or "\0" in value
+                or (not newlines and any(ord(char) < 32 for char in value))
+            ):
+                raise ValidationError(f"Invalid {name}")
+        if not isinstance(self.retryable, bool):
+            raise ValidationError("Invalid retryable value")
+        object.__setattr__(self, "error_type", self.error_type.strip())
+        object.__setattr__(self, "error_code", self.error_code.strip())
+        object.__setattr__(self, "message", self.message.strip())
         object.__setattr__(self, "details", _attributes(self.details))
 
     @classmethod
-    def from_exception(cls, error: Exception) -> Self:
+    def from_exception(cls, error: BaseException) -> Self:
+        if isinstance(
+            error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit)
+        ):
+            raise error
         if isinstance(error, AliOSError):
             return cls(type(error).__name__, error.code, error.message, error.details)
         return cls(type(error).__name__, "unhandled_exception", "An unexpected error occurred")
 
-    def to_dict(self, policy: RedactionPolicy) -> dict[str, JsonValue]:
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        policy = redaction_policy or default_redaction_policy()
         return {
             "error_type": self.error_type,
             "error_code": self.error_code,
@@ -472,6 +714,39 @@ class LogException:
             "details": policy.redact(self.details),
             "retryable": self.retryable,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        if not isinstance(value, Mapping):
+            raise LogSerializationError("Invalid log exception")
+        details = value.get("details", {})
+        error_type = value.get("error_type")
+        error_code = value.get("error_code")
+        message = value.get("message")
+        retryable = value.get("retryable")
+        try:
+            if (
+                not all(isinstance(item, str) for item in (error_type, error_code, message))
+                or not isinstance(details, Mapping)
+                or not isinstance(retryable, bool)
+            ):
+                raise ValueError("invalid exception")
+            if (
+                not isinstance(error_type, str)
+                or not isinstance(error_code, str)
+                or not isinstance(message, str)
+                or not isinstance(retryable, bool)
+            ):
+                raise ValueError("invalid exception")
+            return cls(
+                error_type,
+                error_code,
+                message,
+                details,
+                retryable,
+            )
+        except (TypeError, ValueError, ValidationError, LogSerializationError) as error:
+            raise LogSerializationError("Invalid log exception") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,12 +762,27 @@ class LogRecord:
     timestamp: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.record_id, LogRecordId)
+            or not isinstance(self.level, LogLevel)
+            or not isinstance(self.source, LogSource)
+            or not isinstance(self.context, LogContext)
+        ):
+            raise ValidationError("Invalid log record")
+        if not isinstance(self.message, str) or (
+            self.exception is not None and not isinstance(self.exception, LogException)
+        ):
+            raise ValidationError("Invalid log record")
         message = self.message.strip()
         if not message or len(message) > 16_384 or "\0" in message:
             raise ValidationError("Invalid log message")
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise ValidationError("Log timestamp must be timezone-aware")
-        if self.sequence is not None and self.sequence < 0:
+        if self.sequence is not None and (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or self.sequence < 0
+        ):
             raise ValidationError("Log sequence cannot be negative")
         object.__setattr__(self, "message", message)
         object.__setattr__(self, "attributes", _attributes(self.attributes))
@@ -518,28 +808,40 @@ class LogRecord:
         context = value.get("context")
         attributes = value.get("attributes", {})
         sequence = value.get("sequence")
+        exception = value.get("exception")
+        message = value.get("message")
         if (
             not isinstance(timestamp, str)
             or not isinstance(source, Mapping)
             or not isinstance(context, Mapping)
+            or not isinstance(attributes, Mapping)
+            or not isinstance(message, str)
         ):
             raise LogSerializationError("Invalid log record")
-        parsed = datetime.fromisoformat(timestamp)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise LogSerializationError("Invalid log record timestamp")
         try:
+            parsed = datetime.fromisoformat(timestamp)
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("invalid timestamp")
+            if isinstance(sequence, bool) or (
+                sequence is not None and not isinstance(sequence, (int, str))
+            ):
+                raise ValueError("invalid sequence")
+            if exception is not None and not isinstance(exception, Mapping):
+                raise ValueError("invalid exception")
+            if not isinstance(message, str):
+                raise ValueError("invalid message")
             return cls(
                 LogLevel.parse(str(value["level"])),
-                str(value["message"]),
+                message,
                 LogSource.from_dict(source),
                 LogContext.from_dict(context),
-                attributes if isinstance(attributes, Mapping) else {},
-                None,
-                int(sequence) if isinstance(sequence, (int, str)) else None,
+                attributes,
+                LogException.from_dict(exception) if isinstance(exception, Mapping) else None,
+                _integer(sequence) if sequence is not None else None,
                 LogRecordId(str(value["record_id"])),
                 parsed,
             )
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, ValidationError, LogSerializationError) as error:
             raise LogSerializationError("Invalid log record") from error
 
 
@@ -954,10 +1256,11 @@ class StructuredLogger:
         attributes: Mapping[str, object] | None = None,
         exception: LogException | None = None,
     ) -> LogRecord | None:
+        if not isinstance(level, LogLevel):
+            raise ValidationError("Invalid log level")
         if level.severity < self.minimum_level.severity:
             return None
-        merged = merge_current_log_context(self.base_context)
-        merged = merge_current_log_context(context) if context else merged
+        merged = _merge_log_contexts(current_log_context(), self.base_context, context)
         bound = current_log_context() or LogContext()
         values = {
             **dict(bound.attributes),
@@ -1059,12 +1362,14 @@ class StructuredLogger:
     async def exception(
         self,
         message: str,
-        error: Exception,
+        error: BaseException,
         *,
         operation: str | None = None,
         context: LogContext | None = None,
         attributes: Mapping[str, object] | None = None,
     ) -> LogRecord | None:
+        if LogLevel.ERROR.severity < self.minimum_level.severity:
+            return None
         return await self.log(
             LogLevel.ERROR,
             message,
@@ -1085,8 +1390,10 @@ class StructuredLogger:
             component=self.component or "",
             sink=self.sink,
             minimum_level=self.minimum_level,
-            source_module=module or self.source_module,
-            base_context=merge_current_log_context(context) or self.base_context,
+            source_module=self.source_module
+            if module is None
+            else _validate_text(module, "module", required=True),
+            base_context=_merge_log_contexts(self.base_context, context) or LogContext(),
             base_attributes={**dict(self.base_attributes), **(attributes or {})},
             redaction_policy=self.redaction_policy,
             clock=self._clock,
@@ -1112,6 +1419,7 @@ class LoggerFactory:
         self.clock = clock
         self.owns_sink = owns_sink or sink is None
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     def get_logger(
         self,
@@ -1121,6 +1429,8 @@ class LoggerFactory:
         context: LogContext | None = None,
         attributes: Mapping[str, object] | None = None,
     ) -> StructuredLogger:
+        if self._closed:
+            raise LoggingError("Logger factory is closed")
         return StructuredLogger(
             component=component,
             sink=self.sink,
@@ -1133,6 +1443,9 @@ class LoggerFactory:
         )
 
     async def close(self) -> None:
-        if not self._closed and self.owns_sink:
-            await self.sink.close()
-        self._closed = True
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self.owns_sink:
+                await self.sink.close()
+            self._closed = True
