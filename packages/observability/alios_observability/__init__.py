@@ -1,5 +1,19 @@
 """Provider-neutral observability contracts."""
 
+from .audit import (
+    AuditAction,
+    AuditActor,
+    AuditActorKind,
+    AuditCategory,
+    AuditContext,
+    AuditOutcome,
+    AuditRecord,
+    AuditSeverity,
+    AuditTarget,
+    bind_audit_context,
+    current_audit_context,
+    require_audit_context,
+)
 from .logging import (
     InMemoryLogSink,
     LogContext,
@@ -75,6 +89,18 @@ from .tracing import (
 )
 
 __all__ = [
+    "AuditAction",
+    "AuditActor",
+    "AuditActorKind",
+    "AuditCategory",
+    "AuditContext",
+    "AuditOutcome",
+    "AuditRecord",
+    "AuditSeverity",
+    "AuditTarget",
+    "bind_audit_context",
+    "current_audit_context",
+    "require_audit_context",
     "InMemoryLogSink",
     "LogContext",
     "LogDropPolicy",

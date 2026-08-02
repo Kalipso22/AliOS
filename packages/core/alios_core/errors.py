@@ -128,6 +128,26 @@ class LogSinkError(LoggingError):
     code = "log_sink_error"
 
 
+class AuditError(ObservabilityError):
+    code = "audit_error"
+
+
+class AuditValidationError(AuditError):
+    code = "audit_validation_error"
+
+
+class AuditSerializationError(AuditError):
+    code = "audit_serialization_error"
+
+
+class AuditContextError(AuditError):
+    code = "audit_context_error"
+
+
+class AuditIntegrityError(AuditError):
+    code = "audit_integrity_error"
+
+
 class TracingError(ObservabilityError):
     code = "tracing_error"
 

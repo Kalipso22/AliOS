@@ -12,6 +12,11 @@ from .config import (
 )
 from .container import Container, ServiceKey, ServiceLifetime
 from .errors import (
+    AuditContextError,
+    AuditError,
+    AuditIntegrityError,
+    AuditSerializationError,
+    AuditValidationError,
     SamplingError,
     SpanCompletionError,
     SpanLimitError,
@@ -24,7 +29,7 @@ from .errors import (
     TracerClosedError,
 )
 from .events import AsyncEventBus, BaseEvent, DispatchMode, Event, EventBus, PolicyEvaluated
-from .ids import CorrelationId, LogRecordId, RunId, SpanId, TraceId
+from .ids import AuditRecordId, CorrelationId, LogRecordId, RunId, SpanId, TraceId
 from .lifecycle import LifecycleHealth, LifecycleManager, LifecycleState, ManagedLifecycleComponent
 from .policy import (
     InMemoryPolicyEvaluator,
@@ -40,6 +45,12 @@ from .types import ExecutionMode, RunStatus
 
 __all__ = [
     "AliOSConfig",
+    "AuditContextError",
+    "AuditError",
+    "AuditIntegrityError",
+    "AuditRecordId",
+    "AuditSerializationError",
+    "AuditValidationError",
     "AsyncEventBus",
     "BaseEvent",
     "ConfigurationLoader",
