@@ -8,9 +8,16 @@ from uuid import UUID, uuid4
 import pytest
 from alios_core import CorrelationId, RunId, SpanId, TraceId
 from alios_core.errors import (
+    ResourceConflictError,
+    ResourceNotFoundError,
     SamplingError,
     SpanCompletionError,
     SpanLimitError,
+    SpanProcessorClosedError,
+    SpanProcessorError,
+    SpanRepositoryCapacityError,
+    SpanRepositoryClosedError,
+    SpanRepositoryError,
     SpanStateError,
     SpanValidationError,
     TraceContextError,
@@ -22,16 +29,22 @@ from alios_observability import (
     AlwaysOnSampler,
     AlwaysRecordSampler,
     DefaultTracer,
+    InMemorySpanRepository,
     ParentBasedSampler,
     RedactionPolicy,
     SamplingDecision,
     SamplingRequest,
     SamplingResult,
+    SimpleSpanProcessor,
     SpanEvent,
+    SpanFilter,
     SpanKind,
     SpanLimits,
     SpanLink,
+    SpanProcessorStatus,
     SpanRecord,
+    SpanRepositorySnapshot,
+    SpanRepositoryStatus,
     SpanStatus,
     TraceContext,
     TraceIdRatioSampler,
@@ -1908,3 +1921,1167 @@ async def test_non_recording_event_clock_failure_does_not_change_tracer_status()
     with pytest.raises(RuntimeError):
         await span.add_event("event")
     assert (await tracer.status()).active_count == 1
+
+
+def test_span_filter_defaults() -> None:
+    value = SpanFilter()
+    assert value.trace_ids is None and value.limit is None and value.offset == 0
+
+
+def test_span_filter_trace_ids() -> None:
+    identifier = TraceId()
+    assert SpanFilter(trace_ids=frozenset({identifier})).trace_ids == frozenset({identifier})
+
+
+def test_span_filter_span_ids() -> None:
+    identifier = SpanId()
+    assert SpanFilter(span_ids=frozenset({identifier})).span_ids == frozenset({identifier})
+
+
+def test_span_filter_parent_span_ids() -> None:
+    identifier = SpanId()
+    assert SpanFilter(parent_span_ids=frozenset({identifier})).parent_span_ids == frozenset(
+        {identifier}
+    )
+
+
+def test_span_filter_scope_identifiers() -> None:
+    run, tenant, user = RunId(), TenantId(), UserId()
+    value = SpanFilter(
+        run_ids=frozenset({run}), tenant_ids=frozenset({tenant}), user_ids=frozenset({user})
+    )
+    assert (value.run_ids, value.tenant_ids, value.user_ids) == (
+        frozenset({run}),
+        frozenset({tenant}),
+        frozenset({user}),
+    )
+
+
+def test_span_filter_names() -> None:
+    assert SpanFilter(names=frozenset({" operation "})).names == frozenset({"operation"})
+
+
+def test_span_filter_source_fields() -> None:
+    value = SpanFilter(source_components=frozenset({" api "}), source_modules=frozenset({" web "}))
+    assert value.source_components == frozenset({"api"}) and value.source_modules == frozenset(
+        {"web"}
+    )
+
+
+def test_span_filter_kinds() -> None:
+    assert SpanFilter(kinds=frozenset({SpanKind.CLIENT})).kinds == frozenset({SpanKind.CLIENT})
+
+
+def test_span_filter_statuses() -> None:
+    assert SpanFilter(statuses=frozenset({SpanStatus.ERROR})).statuses == frozenset(
+        {SpanStatus.ERROR}
+    )
+
+
+def test_span_filter_boolean_predicates() -> None:
+    value = SpanFilter(sampled=False, has_exception=True, root_only=False)
+    assert value.sampled is False and value.has_exception is True and value.root_only is False
+
+
+def test_span_filter_attribute_subset() -> None:
+    assert SpanFilter(attribute_equals={" region ": "eu"}).attribute_equals == {"region": "eu"}
+
+
+def test_span_filter_time_ranges() -> None:
+    now = datetime.now(UTC)
+    assert (
+        SpanFilter(started_after=now, started_before=now + timedelta(seconds=1)).started_after
+        == now
+    )
+
+
+def test_span_filter_duration_range() -> None:
+    value = SpanFilter(minimum_duration_ns=1, maximum_duration_ns=2)
+    assert (value.minimum_duration_ns, value.maximum_duration_ns) == (1, 2)
+
+
+def test_span_filter_accepts_limit_zero() -> None:
+    assert SpanFilter(limit=0).limit == 0
+
+
+def test_span_filter_rejects_wrong_trace_id() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(trace_ids=cast(frozenset[TraceId], frozenset({SpanId()})))
+
+
+def test_span_filter_rejects_wrong_span_id() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(span_ids=cast(frozenset[SpanId], frozenset({TraceId()})))
+
+
+def test_span_filter_rejects_wrong_scope_identifier() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(run_ids=cast(frozenset[RunId], frozenset({TenantId()})))
+
+
+def test_span_filter_rejects_wrong_kind() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(kinds=cast(frozenset[SpanKind], frozenset({"client"})))
+
+
+def test_span_filter_rejects_wrong_status() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(statuses=cast(frozenset[SpanStatus], frozenset({"ok"})))
+
+
+def test_span_filter_rejects_non_boolean_sampled() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(sampled=cast(bool, 1))
+
+
+def test_span_filter_rejects_non_boolean_exception_flag() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(has_exception=cast(bool, "yes"))
+
+
+def test_span_filter_rejects_non_boolean_root_only() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(root_only=cast(bool, 0))
+
+
+def test_span_filter_rejects_naive_started_after() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(started_after=datetime.now())
+
+
+def test_span_filter_rejects_naive_ended_before() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(ended_before=datetime.now())
+
+
+def test_span_filter_rejects_inverted_start_range() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(started_after=now, started_before=now)
+
+
+def test_span_filter_rejects_inverted_end_range() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(ended_after=now + timedelta(seconds=1), ended_before=now)
+
+
+def test_span_filter_rejects_negative_duration() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(minimum_duration_ns=-1)
+
+
+def test_span_filter_rejects_boolean_duration() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(maximum_duration_ns=True)
+
+
+def test_span_filter_rejects_inverted_duration_range() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(minimum_duration_ns=2, maximum_duration_ns=1)
+
+
+def test_span_filter_rejects_negative_limit() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(limit=-1)
+
+
+def test_span_filter_rejects_boolean_limit() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(limit=True)
+
+
+def test_span_filter_rejects_negative_offset() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(offset=-1)
+
+
+def test_span_filter_rejects_boolean_offset() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(offset=True)
+
+
+def test_span_filter_rejects_normalized_attribute_collision() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter(attribute_equals={"key": 1, " key ": 2})
+
+
+def test_span_filter_attributes_are_immutable() -> None:
+    values = SpanFilter(attribute_equals={"nested": [1]}).attribute_equals
+    with pytest.raises(TypeError):
+        cast(dict[str, object], values)["nested"] = [2]
+
+
+def test_span_filter_matches_trace_id() -> None:
+    record = _record()
+    assert SpanFilter(trace_ids=frozenset({record.context.trace_id})).matches(record)
+
+
+def test_span_filter_matches_span_id() -> None:
+    record = _record()
+    assert SpanFilter(span_ids=frozenset({record.context.span_id})).matches(record)
+
+
+def test_span_filter_matches_parent_span() -> None:
+    record = _record()
+    assert not SpanFilter(parent_span_ids=frozenset({SpanId()})).matches(record)
+
+
+def test_span_filter_matches_root_only() -> None:
+    assert SpanFilter(root_only=True).matches(_record())
+
+
+def test_span_filter_matches_non_root_only() -> None:
+    assert not SpanFilter(root_only=False).matches(_record())
+
+
+def test_span_filter_matches_name() -> None:
+    assert SpanFilter(names=frozenset({"operation"})).matches(_record())
+
+
+def test_span_filter_matches_source() -> None:
+    assert SpanFilter(source_components=frozenset({"component"})).matches(_record())
+
+
+def test_span_filter_matches_kind() -> None:
+    assert SpanFilter(kinds=frozenset({SpanKind.INTERNAL})).matches(_record())
+
+
+def test_span_filter_matches_status() -> None:
+    assert SpanFilter(statuses=frozenset({SpanStatus.OK})).matches(_record())
+
+
+def test_span_filter_matches_sampled() -> None:
+    assert SpanFilter(sampled=True).matches(_record())
+
+
+def test_span_filter_matches_exception_presence() -> None:
+    assert SpanFilter(has_exception=False).matches(_record())
+
+
+def test_span_filter_matches_attribute_subset() -> None:
+    assert SpanFilter(attribute_equals={}).matches(_record())
+
+
+def test_span_filter_rejects_missing_attribute() -> None:
+    assert not SpanFilter(attribute_equals={"missing": 1}).matches(_record())
+
+
+def test_span_filter_matches_start_time() -> None:
+    record = _record()
+    assert SpanFilter(started_after=record.started_at - timedelta(microseconds=1)).matches(record)
+
+
+def test_span_filter_matches_end_time() -> None:
+    record = _record()
+    assert SpanFilter(ended_before=record.ended_at + timedelta(microseconds=1)).matches(record)
+
+
+def test_span_filter_matches_duration() -> None:
+    assert SpanFilter(minimum_duration_ns=1_000_000_000).matches(_record())
+
+
+def test_span_filter_combines_predicates() -> None:
+    assert (
+        SpanFilter(names=frozenset({"operation"}), statuses=frozenset({SpanStatus.ERROR})).matches(
+            _record()
+        )
+        is False
+    )
+
+
+def test_span_filter_rejects_unknown_record_type() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter().matches(cast(SpanRecord, object()))
+
+
+def test_span_filter_serialization() -> None:
+    assert SpanFilter(names=frozenset({"b", "a"})).to_dict()["names"] == ["a", "b"]
+
+
+def test_span_filter_round_trip() -> None:
+    value = SpanFilter(trace_ids=frozenset({TraceId()}), names=frozenset({"run"}), limit=3)
+    assert (
+        SpanFilter.from_dict(value.to_dict(RedactionPolicy(include_default_rules=False))) == value
+    )
+
+
+def test_span_filter_serialization_is_independent() -> None:
+    rendered = SpanFilter(names=frozenset({"run"})).to_dict()
+    cast(list[str], rendered["names"]).append("other")
+    assert SpanFilter(names=frozenset({"run"})).names == frozenset({"run"})
+
+
+def test_span_filter_rendering_redacts_attributes() -> None:
+    rendered = SpanFilter(attribute_equals={"password": "secret"}).to_dict()
+    assert "secret" not in repr(rendered)
+
+
+def test_span_filter_from_dict_uses_strict_types() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter.from_dict({"limit": "1"})
+
+
+def test_span_filter_from_dict_rejects_invalid_identifier() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter.from_dict({"trace_ids": ["invalid"]})
+
+
+def test_span_filter_from_dict_rejects_unknown_enum() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanFilter.from_dict({"kinds": ["unknown"]})
+
+
+def test_span_repository_status_valid() -> None:
+    assert SpanRepositoryStatus(0, 1, False, datetime.now(UTC)).record_count == 0
+
+
+def test_span_repository_status_rejects_negative_count() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositoryStatus(-1, 1, False, datetime.now(UTC))
+
+
+def test_span_repository_status_rejects_boolean_count() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositoryStatus(True, 1, False, datetime.now(UTC))
+
+
+def test_span_repository_status_rejects_count_over_capacity() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositoryStatus(2, 1, False, datetime.now(UTC))
+
+
+def test_span_repository_status_rejects_naive_timestamp() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositoryStatus(0, 1, False, datetime.now())
+
+
+def test_span_repository_status_serialization() -> None:
+    assert SpanRepositoryStatus(0, 1, False, datetime.now(UTC)).to_dict()["closed"] is False
+
+
+def test_span_repository_status_round_trip() -> None:
+    status = SpanRepositoryStatus(1, 2, True, datetime.now(UTC))
+    assert SpanRepositoryStatus.from_dict(status.to_dict()) == status
+
+
+def test_span_repository_snapshot_empty() -> None:
+    now = datetime.now(UTC)
+    assert SpanRepositorySnapshot(SpanRepositoryStatus(0, 1, False, now), (), now).records == ()
+
+
+def test_span_repository_snapshot_populated() -> None:
+    record = _record()
+    status = SpanRepositoryStatus(1, 2, False, record.started_at)
+    assert SpanRepositorySnapshot(status, (record,), record.ended_at).records == (record,)
+
+
+def test_span_repository_snapshot_rejects_wrong_status() -> None:
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(cast(SpanRepositoryStatus, object()), (), datetime.now(UTC))
+
+
+def test_span_repository_snapshot_rejects_wrong_record() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(
+            SpanRepositoryStatus(1, 2, False, now), cast(tuple[SpanRecord, ...], (object(),)), now
+        )
+
+
+def test_span_repository_snapshot_rejects_unsorted_records() -> None:
+    first = _record()
+    second = SpanRecord(
+        TraceContext.create_root(),
+        "two",
+        first.source,
+        first.kind,
+        first.status,
+        first.started_at,
+        first.ended_at - timedelta(microseconds=1),
+    )
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(
+            SpanRepositoryStatus(2, 2, False, first.started_at), (first, second), first.ended_at
+        )
+
+
+def test_span_repository_snapshot_rejects_duplicate_record_key() -> None:
+    record = _record()
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(
+            SpanRepositoryStatus(2, 2, False, record.started_at), (record, record), record.ended_at
+        )
+
+
+def test_span_repository_snapshot_rejects_naive_time() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(SpanRepositoryStatus(0, 1, False, now), (), datetime.now())
+
+
+def test_span_repository_snapshot_rejects_time_before_creation() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(
+            SpanRepositoryStatus(0, 1, False, now), (), now - timedelta(seconds=1)
+        )
+
+
+def test_unfiltered_span_snapshot_requires_full_record_count() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(SpanRepositoryError):
+        SpanRepositorySnapshot(SpanRepositoryStatus(1, 1, False, now), (), now)
+
+
+def test_filtered_span_snapshot_allows_partial_records() -> None:
+    now = datetime.now(UTC)
+    assert SpanRepositorySnapshot(SpanRepositoryStatus(1, 1, False, now), (), now, True).filtered
+
+
+def test_span_repository_snapshot_serialization() -> None:
+    now = datetime.now(UTC)
+    value = SpanRepositorySnapshot(SpanRepositoryStatus(0, 1, False, now), (), now)
+    assert value.to_dict()["records"] == []
+
+
+def test_span_repository_snapshot_round_trip() -> None:
+    record = _record()
+    value = SpanRepositorySnapshot(
+        SpanRepositoryStatus(1, 1, False, record.started_at), (record,), record.ended_at
+    )
+    rendered = value.to_dict(RedactionPolicy(include_default_rules=False))
+    assert SpanRepositorySnapshot.from_dict(rendered) == value
+
+
+@pytest.mark.asyncio
+async def test_span_repository_default_construction() -> None:
+    assert (await InMemorySpanRepository().status()).maximum_records == 10_000
+
+
+def test_span_repository_rejects_zero_capacity() -> None:
+    with pytest.raises(SpanRepositoryError):
+        InMemorySpanRepository(maximum_records=0)
+
+
+def test_span_repository_rejects_boolean_capacity() -> None:
+    with pytest.raises(SpanRepositoryError):
+        InMemorySpanRepository(maximum_records=True)
+
+
+def test_span_repository_rejects_excessive_capacity() -> None:
+    with pytest.raises(SpanRepositoryError):
+        InMemorySpanRepository(maximum_records=1_000_001)
+
+
+def test_span_repository_rejects_naive_constructor_clock() -> None:
+    with pytest.raises(SpanRepositoryError):
+        InMemorySpanRepository(clock=datetime.now)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_instances_are_isolated() -> None:
+    first, second = InMemorySpanRepository(), InMemorySpanRepository()
+    await first.add(_record())
+    assert await second.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_add() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_add_preserves_record_identity() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.get(record.context.trace_id, record.context.span_id) is record
+
+
+@pytest.mark.asyncio
+async def test_span_repository_rejects_wrong_record_type() -> None:
+    with pytest.raises(SpanRepositoryError):
+        await InMemorySpanRepository().add(cast(SpanRecord, object()))
+
+
+@pytest.mark.asyncio
+async def test_span_repository_rejects_duplicate_record() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    with pytest.raises(ResourceConflictError):
+        await repository.add(record)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_capacity_limit() -> None:
+    repository = InMemorySpanRepository(maximum_records=1)
+    await repository.add(_record())
+    with pytest.raises(SpanRepositoryCapacityError):
+        await repository.add(_record())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_capacity_failure_is_atomic() -> None:
+    repository, first = InMemorySpanRepository(maximum_records=1), _record()
+    await repository.add(first)
+    with pytest.raises(SpanRepositoryCapacityError):
+        await repository.add(_record())
+    assert await repository.list() == (first,)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.get(record.context.trace_id, record.context.span_id) == record
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_optional_existing() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.get_optional(record.context.trace_id, record.context.span_id) is record
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_optional_missing() -> None:
+    assert await InMemorySpanRepository().get_optional(TraceId(), SpanId()) is None
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_missing() -> None:
+    with pytest.raises(ResourceNotFoundError):
+        await InMemorySpanRepository().get(TraceId(), SpanId())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_empty_list() -> None:
+    assert await InMemorySpanRepository().list() == ()
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_all() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.list() == (record,)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_filters_records() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.list(SpanFilter(names=frozenset({"missing"}))) == ()
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_limit_zero() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.list(SpanFilter(limit=0)) == ()
+
+
+@pytest.mark.asyncio
+async def test_span_repository_count_all() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_count_ignores_limit() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.count(SpanFilter(limit=0)) == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_remove_existing() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.remove(record.context.trace_id, record.context.span_id)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_remove_missing() -> None:
+    assert not await InMemorySpanRepository().remove(TraceId(), SpanId())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_all() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.reset() == 1 and await repository.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_filtered() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    assert await repository.reset(SpanFilter(names=frozenset({record.name}))) == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.close()
+    assert (await repository.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_span_repository_repeated_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.close()
+    await repository.close()
+    assert (await repository.status()).record_count == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_add_after_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.close()
+    with pytest.raises(SpanRepositoryClosedError):
+        await repository.add(_record())
+
+
+def test_span_processor_status_valid() -> None:
+    assert SpanProcessorStatus(1, 1, 0, 0, False, datetime.now(UTC)).processed_count == 1
+
+
+def test_span_processor_status_rejects_invalid_invariant() -> None:
+    with pytest.raises(SpanProcessorError):
+        SpanProcessorStatus(1, 0, 0, 0, False, datetime.now(UTC))
+
+
+def test_span_processor_status_rejects_boolean_count() -> None:
+    with pytest.raises(SpanProcessorError):
+        SpanProcessorStatus(True, 1, 0, 0, False, datetime.now(UTC))
+
+
+def test_span_processor_status_serialization() -> None:
+    assert (
+        SpanProcessorStatus(0, 0, 0, 0, False, datetime.now(UTC)).to_dict()["received_count"] == 0
+    )
+
+
+def test_span_processor_status_round_trip() -> None:
+    value = SpanProcessorStatus(1, 0, 1, 0, True, datetime.now(UTC))
+    assert SpanProcessorStatus.from_dict(value.to_dict()) == value
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_initial_status() -> None:
+    assert (await SimpleSpanProcessor(InMemorySpanRepository()).status()).received_count == 0
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_processes_record() -> None:
+    repository, processor, record = InMemorySpanRepository(), None, _record()
+    processor = SimpleSpanProcessor(repository)
+    await processor.on_end(record)
+    assert await repository.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_rejects_wrong_record() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    with pytest.raises(SpanProcessorError):
+        await processor.on_end(cast(SpanRecord, object()))
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_wraps_repository_failure() -> None:
+    repository, record = InMemorySpanRepository(maximum_records=1), _record()
+    await repository.add(record)
+    with pytest.raises(SpanProcessorError):
+        await SimpleSpanProcessor(repository).on_end(_record())
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_status_tracks_success() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.on_end(_record())
+    assert (await processor.status()).processed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_force_flush() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.force_flush()
+    assert (await processor.status()).in_flight_count == 0
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_close() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.close()
+    assert (await processor.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_repeated_close() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.close()
+    await processor.close()
+    assert (await processor.status()).closed is True
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_rejects_after_close() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.close()
+    with pytest.raises(SpanProcessorClosedError):
+        await processor.on_end(_record())
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_external_repository_remains_open() -> None:
+    repository, processor = InMemorySpanRepository(), None
+    processor = SimpleSpanProcessor(repository)
+    await processor.close()
+    assert not (await repository.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_owned_repository_closes() -> None:
+    repository = InMemorySpanRepository()
+    await SimpleSpanProcessor(repository, close_repository=True).close()
+    assert (await repository.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_force_flush_after_close() -> None:
+    processor = SimpleSpanProcessor(InMemorySpanRepository())
+    await processor.close()
+    await processor.force_flush()
+    assert (await processor.status()).in_flight_count == 0
+
+
+def test_span_filter_matches_scope_identifiers() -> None:
+    now, correlation, run = datetime.now(UTC), CorrelationId(), RunId()
+    context = TraceContext.create_root(correlation_id=correlation, run_id=run)
+    record = SpanRecord(
+        context, "scope", TraceSource("unit"), SpanKind.INTERNAL, SpanStatus.OK, now, now
+    )
+    assert SpanFilter(correlation_ids=frozenset({correlation}), run_ids=frozenset({run})).matches(
+        record
+    )
+
+
+@pytest.mark.asyncio
+async def test_span_repository_concurrent_final_slot() -> None:
+    repository = InMemorySpanRepository(maximum_records=1)
+    results = await asyncio.gather(
+        repository.add(_record()), repository.add(_record()), return_exceptions=True
+    )
+    assert sum(result is None for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_error_omits_record_values() -> None:
+    secret, repository = "UNIT-REPOSITORY-SECRET", InMemorySpanRepository(maximum_records=1)
+    await repository.add(_record())
+    with pytest.raises(SpanRepositoryCapacityError) as captured:
+        await repository.add(
+            SpanRecord(
+                TraceContext.create_root(),
+                secret,
+                TraceSource("unit"),
+                SpanKind.INTERNAL,
+                SpanStatus.OK,
+                datetime.now(UTC),
+                datetime.now(UTC),
+            )
+        )
+    assert secret not in repr(captured.value.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_rejects_wrong_trace_id() -> None:
+    with pytest.raises(SpanRepositoryError):
+        await InMemorySpanRepository().get(cast(TraceId, SpanId()), SpanId())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_rejects_wrong_span_id() -> None:
+    with pytest.raises(SpanRepositoryError):
+        await InMemorySpanRepository().get(TraceId(), cast(SpanId, TraceId()))
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_canonical_order() -> None:
+    repository, now = InMemorySpanRepository(), datetime.now(UTC)
+    later = SpanRecord(
+        TraceContext.create_root(),
+        "later",
+        TraceSource("unit"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now + timedelta(seconds=2),
+    )
+    earlier = SpanRecord(
+        TraceContext.create_root(),
+        "earlier",
+        TraceSource("unit"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now + timedelta(seconds=1),
+    )
+    await repository.add(later)
+    await repository.add(earlier)
+    assert await repository.list() == (earlier, later)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_applies_offset_after_sort() -> None:
+    repository, now = InMemorySpanRepository(), datetime.now(UTC)
+    first = SpanRecord(
+        TraceContext.create_root(),
+        "first",
+        TraceSource("unit"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now,
+    )
+    second = SpanRecord(
+        TraceContext.create_root(),
+        "second",
+        TraceSource("unit"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now + timedelta(seconds=1),
+    )
+    await repository.add(second)
+    await repository.add(first)
+    assert await repository.list(SpanFilter(offset=1)) == (second,)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_applies_limit_after_offset() -> None:
+    repository, now = InMemorySpanRepository(), datetime.now(UTC)
+    records = tuple(
+        SpanRecord(
+            TraceContext.create_root(),
+            name,
+            TraceSource("unit"),
+            SpanKind.INTERNAL,
+            SpanStatus.OK,
+            now,
+            now + timedelta(seconds=index),
+        )
+        for index, name in enumerate(("zero", "one", "two"))
+    )
+    for record in records:
+        await repository.add(record)
+    assert await repository.list(SpanFilter(offset=1, limit=1)) == (records[1],)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_count_filters_records() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.count(SpanFilter(names=frozenset({"absent"}))) == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_count_ignores_offset() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.count(SpanFilter(offset=5)) == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_query_returns_immutable_tuple() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert isinstance(await repository.list(), tuple)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_complete() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    snapshot = await repository.snapshot()
+    assert len(snapshot.records) == snapshot.status.record_count == 1 and not snapshot.filtered
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_filtered() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    snapshot = await repository.snapshot(SpanFilter(limit=0))
+    assert snapshot.filtered and snapshot.records == () and snapshot.status.record_count == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_uses_injected_clock() -> None:
+    created, collected = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
+    values = iter((created, collected))
+    snapshot = await InMemorySpanRepository(clock=lambda: next(values)).snapshot()
+    assert snapshot.collected_at == collected
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_rejects_naive_clock() -> None:
+    aware, naive = datetime.now(UTC), datetime.now()
+    values = iter((aware, naive))
+    repository = InMemorySpanRepository(clock=lambda: next(values))
+    with pytest.raises(SpanRepositoryError):
+        await repository.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_rejects_clock_before_creation() -> None:
+    created = datetime(2026, 1, 2, tzinfo=UTC)
+    values = iter((created, created - timedelta(seconds=1)))
+    repository = InMemorySpanRepository(clock=lambda: next(values))
+    with pytest.raises(SpanRepositoryError):
+        await repository.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_old_span_snapshot_unchanged_after_add() -> None:
+    repository = InMemorySpanRepository()
+    snapshot = await repository.snapshot()
+    await repository.add(_record())
+    assert snapshot.records == ()
+
+
+@pytest.mark.asyncio
+async def test_old_span_snapshot_unchanged_after_reset() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    snapshot = await repository.snapshot()
+    await repository.reset()
+    assert len(snapshot.records) == 1
+
+
+def test_span_repository_snapshot_serialization_is_independent() -> None:
+    now = datetime.now(UTC)
+    snapshot = SpanRepositorySnapshot(SpanRepositoryStatus(0, 1, False, now), (), now)
+    rendered = snapshot.to_dict()
+    cast(list[object], rendered["records"]).append({})
+    assert snapshot.records == ()
+
+
+def test_span_repository_snapshot_rendering_redacts_records() -> None:
+    secret, now = "UNIT-SNAPSHOT-SECRET", datetime.now(UTC)
+    record = SpanRecord(
+        TraceContext.create_root(),
+        "safe",
+        TraceSource("unit"),
+        SpanKind.INTERNAL,
+        SpanStatus.OK,
+        now,
+        now,
+        attributes={"password": secret},
+    )
+    snapshot = SpanRepositorySnapshot(SpanRepositoryStatus(1, 1, False, now), (record,), now)
+    assert secret not in repr(snapshot.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_span_repository_remove_frees_capacity() -> None:
+    repository, record = InMemorySpanRepository(maximum_records=1), _record()
+    await repository.add(record)
+    await repository.remove(record.context.trace_id, record.context.span_id)
+    await repository.add(_record())
+    assert await repository.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_respects_pagination() -> None:
+    repository, now = InMemorySpanRepository(), datetime.now(UTC)
+    records = tuple(
+        SpanRecord(
+            TraceContext.create_root(),
+            name,
+            TraceSource("unit"),
+            SpanKind.INTERNAL,
+            SpanStatus.OK,
+            now,
+            now + timedelta(seconds=index),
+        )
+        for index, name in enumerate(("first", "second", "third"))
+    )
+    for record in records:
+        await repository.add(record)
+    assert await repository.reset(SpanFilter(offset=1, limit=1)) == 1
+    assert await repository.list() == (records[0], records[2])
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_empty_match() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    assert await repository.reset(SpanFilter(names=frozenset({"none"}))) == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_frees_capacity() -> None:
+    repository = InMemorySpanRepository(maximum_records=1)
+    await repository.add(_record())
+    await repository.reset()
+    await repository.add(_record())
+    assert await repository.count() == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_status_tracks_reset() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    await repository.reset()
+    assert (await repository.status()).record_count == 0
+
+
+@pytest.mark.asyncio
+async def test_span_repository_get_after_close() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    await repository.close()
+    assert await repository.get(record.context.trace_id, record.context.span_id) is record
+
+
+@pytest.mark.asyncio
+async def test_span_repository_list_after_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.close()
+    assert await repository.list() == ()
+
+
+@pytest.mark.asyncio
+async def test_span_repository_snapshot_after_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.close()
+    assert (await repository.snapshot()).status.closed
+
+
+@pytest.mark.asyncio
+async def test_span_repository_remove_after_close() -> None:
+    repository, record = InMemorySpanRepository(), _record()
+    await repository.add(record)
+    await repository.close()
+    assert await repository.remove(record.context.trace_id, record.context.span_id)
+
+
+@pytest.mark.asyncio
+async def test_span_repository_reset_after_close() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    await repository.close()
+    assert await repository.reset() == 1
+
+
+@pytest.mark.asyncio
+async def test_span_repository_close_does_not_clear_records() -> None:
+    repository = InMemorySpanRepository()
+    await repository.add(_record())
+    await repository.close()
+    assert await repository.count() == 1
+
+
+class _BlockingSpanRepository(InMemorySpanRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def add(self, record: SpanRecord) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await super().add(record)
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_failure_preserves_cause() -> None:
+    repository = InMemorySpanRepository(maximum_records=1)
+    await repository.add(_record())
+    with pytest.raises(SpanProcessorError) as captured:
+        await SimpleSpanProcessor(repository).on_end(_record())
+    assert isinstance(captured.value.__cause__, SpanRepositoryCapacityError)
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_status_tracks_failure() -> None:
+    repository = InMemorySpanRepository(maximum_records=1)
+    await repository.add(_record())
+    processor = SimpleSpanProcessor(repository)
+    with pytest.raises(SpanProcessorError):
+        await processor.on_end(_record())
+    assert (await processor.status()).failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_concurrent_processing() -> None:
+    processor, repository = SimpleSpanProcessor(InMemorySpanRepository()), InMemorySpanRepository()
+    processor = SimpleSpanProcessor(repository)
+    await asyncio.gather(processor.on_end(_record()), processor.on_end(_record()))
+    assert (await processor.status()).processed_count == 2
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_force_flush_waits_for_in_flight() -> None:
+    repository = _BlockingSpanRepository()
+    processor = SimpleSpanProcessor(repository)
+    delivery = asyncio.create_task(processor.on_end(_record()))
+    await repository.entered.wait()
+    flush = asyncio.create_task(processor.force_flush())
+    assert not flush.done()
+    repository.release.set()
+    await delivery
+    await flush
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_close_waits_for_in_flight() -> None:
+    repository = _BlockingSpanRepository()
+    processor = SimpleSpanProcessor(repository)
+    delivery = asyncio.create_task(processor.on_end(_record()))
+    await repository.entered.wait()
+    closing = asyncio.create_task(processor.close())
+    assert not closing.done()
+    repository.release.set()
+    await delivery
+    await closing
+
+
+class _CountingCloseRepository(InMemorySpanRepository):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.close_count = 0
+        self.fail = fail
+
+    async def close(self) -> None:
+        self.close_count += 1
+        if self.fail:
+            raise RuntimeError("safe close failure")
+        await super().close()
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_owned_repository_closes_once() -> None:
+    repository = _CountingCloseRepository()
+    processor = SimpleSpanProcessor(repository, close_repository=True)
+    await asyncio.gather(processor.close(), processor.close())
+    assert repository.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_repository_close_failure() -> None:
+    repository = _CountingCloseRepository(fail=True)
+    processor = SimpleSpanProcessor(repository, close_repository=True)
+    with pytest.raises(SpanProcessorError):
+        await processor.close()
+    assert (await processor.status()).closed
+
+
+@pytest.mark.asyncio
+async def test_simple_span_processor_creates_no_background_task() -> None:
+    before = asyncio.all_tasks()
+    SimpleSpanProcessor(InMemorySpanRepository())
+    assert asyncio.all_tasks() == before

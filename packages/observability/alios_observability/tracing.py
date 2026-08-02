@@ -16,9 +16,16 @@ from typing import Protocol, Self, cast
 
 from alios_core.errors import (
     LogSerializationError,
+    ResourceConflictError,
+    ResourceNotFoundError,
     SamplingError,
     SpanCompletionError,
     SpanLimitError,
+    SpanProcessorClosedError,
+    SpanProcessorError,
+    SpanRepositoryCapacityError,
+    SpanRepositoryClosedError,
+    SpanRepositoryError,
     SpanStateError,
     SpanValidationError,
     TraceContextError,
@@ -922,6 +929,779 @@ class NoOpSpanEndHandler:
     async def on_end(self, record: SpanRecord) -> None:
         if not isinstance(record, SpanRecord):
             raise SpanValidationError("Invalid span record")
+
+
+def _record_order(record: SpanRecord) -> tuple[datetime, datetime, str, str]:
+    return (
+        record.ended_at,
+        record.started_at,
+        str(record.context.trace_id),
+        str(record.context.span_id),
+    )
+
+
+def _repository_aware(value: object, field_name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise SpanRepositoryError(
+            "Invalid span repository timestamp", details={"field_name": field_name}
+        )
+    return value
+
+
+def _repository_integer(
+    value: object, field_name: str, *, minimum: int = 0, maximum: int | None = None
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or maximum is not None
+        and value > maximum
+    ):
+        raise SpanRepositoryError(
+            "Invalid span repository integer", details={"field_name": field_name}
+        )
+    return value
+
+
+def _filter_set(value: object, kind: type[object], field_name: str) -> frozenset[object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (set, frozenset, list, tuple)):
+        raise SpanRepositoryError("Invalid span filter", details={"field_name": field_name})
+    result = frozenset(value)
+    if not all(type(item) is kind for item in result):
+        raise SpanRepositoryError("Invalid span filter", details={"field_name": field_name})
+    return result or None
+
+
+@dataclass(frozen=True, slots=True)
+class SpanFilter:
+    trace_ids: frozenset[TraceId] | None = None
+    span_ids: frozenset[SpanId] | None = None
+    parent_span_ids: frozenset[SpanId] | None = None
+    correlation_ids: frozenset[CorrelationId] | None = None
+    run_ids: frozenset[RunId] | None = None
+    tenant_ids: frozenset[TenantId] | None = None
+    user_ids: frozenset[UserId] | None = None
+    names: frozenset[str] | None = None
+    source_components: frozenset[str] | None = None
+    source_modules: frozenset[str] | None = None
+    source_operations: frozenset[str] | None = None
+    kinds: frozenset[SpanKind] | None = None
+    statuses: frozenset[SpanStatus] | None = None
+    sampled: bool | None = None
+    has_exception: bool | None = None
+    root_only: bool | None = None
+    attribute_equals: Mapping[str, object] = field(default_factory=dict)
+    started_after: datetime | None = None
+    started_before: datetime | None = None
+    ended_after: datetime | None = None
+    ended_before: datetime | None = None
+    minimum_duration_ns: int | None = None
+    maximum_duration_ns: int | None = None
+    limit: int | None = None
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        sets: tuple[tuple[str, type[object]], ...] = (
+            ("trace_ids", TraceId),
+            ("span_ids", SpanId),
+            ("parent_span_ids", SpanId),
+            ("correlation_ids", CorrelationId),
+            ("run_ids", RunId),
+            ("tenant_ids", TenantId),
+            ("user_ids", UserId),
+            ("kinds", SpanKind),
+            ("statuses", SpanStatus),
+        )
+        for name, kind in sets:
+            object.__setattr__(self, name, _filter_set(getattr(self, name), kind, name))
+        for name, maximum, required in (
+            ("names", 512, True),
+            ("source_components", 256, True),
+            ("source_modules", 256, False),
+            ("source_operations", 256, False),
+        ):
+            raw = _filter_set(getattr(self, name), str, name)
+            if raw is not None:
+                try:
+                    normalized_values = tuple(
+                        _text(item, name, maximum, required=required) for item in raw
+                    )
+                    if any(item is None for item in normalized_values):
+                        raise SpanValidationError("Invalid span filter source field")
+                    values = frozenset(cast(str, item) for item in normalized_values)
+                except SpanValidationError as error:
+                    raise SpanRepositoryError(
+                        "Invalid span filter", details={"field_name": name}, cause=error
+                    ) from error
+                object.__setattr__(self, name, values or None)
+        for name in ("sampled", "has_exception", "root_only"):
+            if getattr(self, name) is not None and not isinstance(getattr(self, name), bool):
+                raise SpanRepositoryError("Invalid span filter", details={"field_name": name})
+        try:
+            object.__setattr__(
+                self, "attribute_equals", _normalize_span_attributes(self.attribute_equals)
+            )
+        except (SpanValidationError, TraceSerializationError) as error:
+            raise SpanRepositoryError(
+                "Invalid span filter", details={"field_name": "attribute_equals"}, cause=error
+            ) from error
+        for name in ("started_after", "started_before", "ended_after", "ended_before"):
+            value = getattr(self, name)
+            if value is not None:
+                _repository_aware(value, name)
+        if (
+            self.started_after is not None
+            and self.started_before is not None
+            and self.started_after >= self.started_before
+        ):
+            raise SpanRepositoryError(
+                "Invalid span filter time range", details={"field_name": "started_at"}
+            )
+        if (
+            self.ended_after is not None
+            and self.ended_before is not None
+            and self.ended_after >= self.ended_before
+        ):
+            raise SpanRepositoryError(
+                "Invalid span filter time range", details={"field_name": "ended_at"}
+            )
+        for name in ("minimum_duration_ns", "maximum_duration_ns"):
+            value = getattr(self, name)
+            if value is not None:
+                _repository_integer(value, name)
+        if (
+            self.minimum_duration_ns is not None
+            and self.maximum_duration_ns is not None
+            and self.minimum_duration_ns > self.maximum_duration_ns
+        ):
+            raise SpanRepositoryError(
+                "Invalid span filter duration range", details={"field_name": "duration_ns"}
+            )
+        if self.limit is not None:
+            _repository_integer(self.limit, "limit")
+        _repository_integer(self.offset, "offset")
+
+    def matches(self, record: SpanRecord) -> bool:
+        if not isinstance(record, SpanRecord):
+            raise SpanRepositoryError("Invalid span repository record")
+        context = record.context
+        checks = (
+            self.trace_ids is None or context.trace_id in self.trace_ids,
+            self.span_ids is None or context.span_id in self.span_ids,
+            self.parent_span_ids is None
+            or context.parent_span_id is not None
+            and context.parent_span_id in self.parent_span_ids,
+            self.correlation_ids is None or context.correlation_id in self.correlation_ids,
+            self.run_ids is None or context.run_id in self.run_ids,
+            self.tenant_ids is None or context.tenant_id in self.tenant_ids,
+            self.user_ids is None or context.user_id in self.user_ids,
+            self.names is None or record.name in self.names,
+            self.source_components is None or record.source.component in self.source_components,
+            self.source_modules is None or record.source.module in self.source_modules,
+            self.source_operations is None or record.source.operation in self.source_operations,
+            self.kinds is None or record.kind in self.kinds,
+            self.statuses is None or record.status in self.statuses,
+            self.sampled is None or context.sampled is self.sampled,
+            self.has_exception is None or (record.exception is not None) is self.has_exception,
+            self.root_only is None or (context.parent_span_id is None) is self.root_only,
+            self.started_after is None or record.started_at > self.started_after,
+            self.started_before is None or record.started_at < self.started_before,
+            self.ended_after is None or record.ended_at > self.ended_after,
+            self.ended_before is None or record.ended_at < self.ended_before,
+            self.minimum_duration_ns is None or record.duration_ns >= self.minimum_duration_ns,
+            self.maximum_duration_ns is None or record.duration_ns <= self.maximum_duration_ns,
+        )
+        return all(checks) and all(
+            name in record.attributes and record.attributes[name] == value
+            for name, value in self.attribute_equals.items()
+        )
+
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        policy = redaction_policy or default_redaction_policy()
+        identifiers = (
+            "trace_ids",
+            "span_ids",
+            "parent_span_ids",
+            "correlation_ids",
+            "run_ids",
+            "tenant_ids",
+            "user_ids",
+        )
+        result: dict[str, JsonValue] = {}
+        for name in identifiers:
+            value = getattr(self, name)
+            result[name] = cast(
+                JsonValue, sorted(str(item) for item in value) if value is not None else None
+            )
+        for name in ("names", "source_components", "source_modules", "source_operations"):
+            value = getattr(self, name)
+            result[name] = cast(JsonValue, sorted(value) if value is not None else None)
+        result["kinds"] = cast(
+            JsonValue, sorted(item.value for item in self.kinds) if self.kinds else None
+        )
+        result["statuses"] = cast(
+            JsonValue, sorted(item.value for item in self.statuses) if self.statuses else None
+        )
+        for name in ("sampled", "has_exception", "root_only"):
+            result[name] = getattr(self, name)
+        result["attribute_equals"] = policy.redact(self.attribute_equals)
+        for name in ("started_after", "started_before", "ended_after", "ended_before"):
+            value = getattr(self, name)
+            result[name] = value.isoformat() if value is not None else None
+        for name in ("minimum_duration_ns", "maximum_duration_ns", "limit", "offset"):
+            result[name] = getattr(self, name)
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+            identifier_kinds: dict[str, type[Identifier]] = {
+                "trace_ids": TraceId,
+                "span_ids": SpanId,
+                "parent_span_ids": SpanId,
+                "correlation_ids": CorrelationId,
+                "run_ids": RunId,
+                "tenant_ids": TenantId,
+                "user_ids": UserId,
+            }
+            parsed: dict[str, object] = {}
+            for name, kind in identifier_kinds.items():
+                raw = value.get(name)
+                if raw is not None and (
+                    not isinstance(raw, (list, tuple))
+                    or not all(isinstance(item, str) for item in raw)
+                ):
+                    raise ValueError
+                parsed[name] = frozenset(kind(item) for item in raw) if raw is not None else None
+            for name in ("names", "source_components", "source_modules", "source_operations"):
+                raw = value.get(name)
+                if raw is not None and (
+                    not isinstance(raw, (list, tuple))
+                    or not all(isinstance(item, str) for item in raw)
+                ):
+                    raise ValueError
+                parsed[name] = frozenset(raw) if raw is not None else None
+            for name, enum_kind in (("kinds", SpanKind), ("statuses", SpanStatus)):
+                raw = value.get(name)
+                if raw is not None and (
+                    not isinstance(raw, (list, tuple))
+                    or not all(isinstance(item, str) for item in raw)
+                ):
+                    raise ValueError
+                parsed[name] = (
+                    frozenset(enum_kind(item) for item in raw) if raw is not None else None
+                )
+            for name in ("sampled", "has_exception", "root_only"):
+                raw = value.get(name)
+                if raw is not None and not isinstance(raw, bool):
+                    raise ValueError
+                parsed[name] = raw
+            attributes = value.get("attribute_equals", {})
+            if not isinstance(attributes, Mapping):
+                raise ValueError
+            parsed["attribute_equals"] = attributes
+            for name in ("started_after", "started_before", "ended_after", "ended_before"):
+                raw = value.get(name)
+                if raw is not None and not isinstance(raw, str):
+                    raise ValueError
+                parsed[name] = datetime.fromisoformat(raw) if raw is not None else None
+            for name in ("minimum_duration_ns", "maximum_duration_ns", "limit"):
+                raw = value.get(name)
+                if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+                    raise ValueError
+                parsed[name] = raw
+            offset = value.get("offset", 0)
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                raise ValueError
+            parsed["offset"] = offset
+            return cls(
+                cast(frozenset[TraceId] | None, parsed["trace_ids"]),
+                cast(frozenset[SpanId] | None, parsed["span_ids"]),
+                cast(frozenset[SpanId] | None, parsed["parent_span_ids"]),
+                cast(frozenset[CorrelationId] | None, parsed["correlation_ids"]),
+                cast(frozenset[RunId] | None, parsed["run_ids"]),
+                cast(frozenset[TenantId] | None, parsed["tenant_ids"]),
+                cast(frozenset[UserId] | None, parsed["user_ids"]),
+                cast(frozenset[str] | None, parsed["names"]),
+                cast(frozenset[str] | None, parsed["source_components"]),
+                cast(frozenset[str] | None, parsed["source_modules"]),
+                cast(frozenset[str] | None, parsed["source_operations"]),
+                cast(frozenset[SpanKind] | None, parsed["kinds"]),
+                cast(frozenset[SpanStatus] | None, parsed["statuses"]),
+                cast(bool | None, parsed["sampled"]),
+                cast(bool | None, parsed["has_exception"]),
+                cast(bool | None, parsed["root_only"]),
+                cast(Mapping[str, object], parsed["attribute_equals"]),
+                cast(datetime | None, parsed["started_after"]),
+                cast(datetime | None, parsed["started_before"]),
+                cast(datetime | None, parsed["ended_after"]),
+                cast(datetime | None, parsed["ended_before"]),
+                cast(int | None, parsed["minimum_duration_ns"]),
+                cast(int | None, parsed["maximum_duration_ns"]),
+                cast(int | None, parsed["limit"]),
+                cast(int, parsed["offset"]),
+            )
+        except (TypeError, ValueError, SpanRepositoryError) as error:
+            raise SpanRepositoryError("Invalid serialized span filter", cause=error) from error
+
+
+@dataclass(frozen=True, slots=True)
+class SpanRepositoryStatus:
+    record_count: int
+    maximum_records: int
+    closed: bool
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        _repository_integer(self.record_count, "record_count")
+        _repository_integer(self.maximum_records, "maximum_records", minimum=1)
+        if self.record_count > self.maximum_records or not isinstance(self.closed, bool):
+            raise SpanRepositoryError("Invalid span repository status")
+        _repository_aware(self.created_at, "created_at")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "record_count": self.record_count,
+            "maximum_records": self.maximum_records,
+            "closed": self.closed,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("closed"), bool)
+                or not isinstance(value.get("created_at"), str)
+            ):
+                raise ValueError
+            count, maximum = value["record_count"], value["maximum_records"]
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or isinstance(maximum, bool)
+                or not isinstance(maximum, int)
+            ):
+                raise ValueError
+            return cls(
+                count,
+                maximum,
+                cast(bool, value["closed"]),
+                datetime.fromisoformat(cast(str, value["created_at"])),
+            )
+        except (KeyError, TypeError, ValueError, SpanRepositoryError) as error:
+            raise SpanRepositoryError(
+                "Invalid serialized span repository status", cause=error
+            ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class SpanRepositorySnapshot:
+    status: SpanRepositoryStatus
+    records: tuple[SpanRecord, ...]
+    collected_at: datetime
+    filtered: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.status, SpanRepositoryStatus)
+            or not isinstance(self.records, tuple)
+            or not all(isinstance(item, SpanRecord) for item in self.records)
+        ):
+            raise SpanRepositoryError("Invalid span repository snapshot")
+        object.__setattr__(self, "records", tuple(self.records))
+        if tuple(sorted(self.records, key=_record_order)) != self.records:
+            raise SpanRepositoryError("Invalid span repository snapshot ordering")
+        keys = tuple((item.context.trace_id, item.context.span_id) for item in self.records)
+        if len(set(keys)) != len(keys):
+            raise SpanRepositoryError("Duplicate span repository snapshot record")
+        _repository_aware(self.collected_at, "collected_at")
+        if self.collected_at < self.status.created_at or not isinstance(self.filtered, bool):
+            raise SpanRepositoryError("Invalid span repository snapshot")
+        if not self.filtered and len(self.records) != self.status.record_count:
+            raise SpanRepositoryError("Incomplete span repository snapshot")
+
+    def to_dict(self, redaction_policy: RedactionPolicy | None = None) -> dict[str, JsonValue]:
+        policy = redaction_policy or default_redaction_policy()
+        return {
+            "status": self.status.to_dict(),
+            "records": [record.to_dict(policy) for record in self.records],
+            "collected_at": self.collected_at.isoformat(),
+            "filtered": self.filtered,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("status"), Mapping)
+                or not isinstance(value.get("records"), (list, tuple))
+                or not isinstance(value.get("collected_at"), str)
+                or not isinstance(value.get("filtered"), bool)
+            ):
+                raise ValueError
+            raw_records = cast(list[object] | tuple[object, ...], value["records"])
+            if not all(isinstance(item, Mapping) for item in raw_records):
+                raise ValueError
+            records = tuple(
+                SpanRecord.from_dict(cast(Mapping[str, object], item)) for item in raw_records
+            )
+            return cls(
+                SpanRepositoryStatus.from_dict(cast(Mapping[str, object], value["status"])),
+                records,
+                datetime.fromisoformat(cast(str, value["collected_at"])),
+                cast(bool, value["filtered"]),
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            SpanRepositoryError,
+            TraceSerializationError,
+        ) as error:
+            raise SpanRepositoryError(
+                "Invalid serialized span repository snapshot", cause=error
+            ) from error
+
+
+class SpanRepository(Protocol):
+    async def add(self, record: SpanRecord) -> None: ...
+    async def get(self, trace_id: TraceId, span_id: SpanId) -> SpanRecord: ...
+    async def get_optional(self, trace_id: TraceId, span_id: SpanId) -> SpanRecord | None: ...
+    async def list(self, filter: SpanFilter | None = None) -> tuple[SpanRecord, ...]: ...
+    async def count(self, filter: SpanFilter | None = None) -> int: ...
+    async def snapshot(self, filter: SpanFilter | None = None) -> SpanRepositorySnapshot: ...
+    async def remove(self, trace_id: TraceId, span_id: SpanId) -> bool: ...
+    async def reset(self, filter: SpanFilter | None = None) -> int: ...
+    async def status(self) -> SpanRepositoryStatus: ...
+    async def close(self) -> None: ...
+
+
+class InMemorySpanRepository:
+    def __init__(
+        self, *, maximum_records: int = 10_000, clock: Callable[[], datetime] = utc_now
+    ) -> None:
+        self._maximum_records = _repository_integer(
+            maximum_records, "maximum_records", minimum=1, maximum=1_000_000
+        )
+        if not callable(clock):
+            raise SpanRepositoryError("Invalid span repository clock")
+        self._clock = clock
+        self._created_at = _repository_aware(clock(), "created_at")
+        self._records: dict[tuple[TraceId, SpanId], SpanRecord] = {}
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _key(trace_id: TraceId, span_id: SpanId) -> tuple[TraceId, SpanId]:
+        if type(trace_id) is not TraceId:
+            raise SpanRepositoryError(
+                "Invalid span repository identifier", details={"field_name": "trace_id"}
+            )
+        if type(span_id) is not SpanId:
+            raise SpanRepositoryError(
+                "Invalid span repository identifier", details={"field_name": "span_id"}
+            )
+        return trace_id, span_id
+
+    @staticmethod
+    def _filter(value: SpanFilter | None) -> SpanFilter | None:
+        if value is not None and not isinstance(value, SpanFilter):
+            raise SpanRepositoryError("Invalid span repository filter")
+        return value
+
+    @staticmethod
+    def _select(
+        records: tuple[SpanRecord, ...], filter: SpanFilter | None, *, paginate: bool = True
+    ) -> tuple[SpanRecord, ...]:
+        selected = sorted(
+            (record for record in records if filter is None or filter.matches(record)),
+            key=_record_order,
+        )
+        if filter is None or not paginate:
+            return tuple(selected)
+        selected = selected[filter.offset :]
+        if filter.limit is not None:
+            selected = selected[: filter.limit]
+        return tuple(selected)
+
+    async def add(self, record: SpanRecord) -> None:
+        if not isinstance(record, SpanRecord):
+            raise SpanRepositoryError("Invalid span repository record")
+        key = (record.context.trace_id, record.context.span_id)
+        async with self._lock:
+            if self._closed:
+                raise SpanRepositoryClosedError("Span repository is closed")
+            if key in self._records:
+                raise ResourceConflictError(
+                    "Completed span already exists",
+                    details={"trace_id": str(key[0]), "span_id": str(key[1])},
+                )
+            if len(self._records) >= self._maximum_records:
+                raise SpanRepositoryCapacityError(
+                    "Span repository capacity reached",
+                    details={
+                        "record_count": len(self._records),
+                        "maximum_records": self._maximum_records,
+                    },
+                )
+            self._records[key] = record
+
+    async def get(self, trace_id: TraceId, span_id: SpanId) -> SpanRecord:
+        key = self._key(trace_id, span_id)
+        async with self._lock:
+            record = self._records.get(key)
+        if record is None:
+            raise ResourceNotFoundError(
+                "Completed span was not found",
+                details={"trace_id": str(trace_id), "span_id": str(span_id)},
+            )
+        return record
+
+    async def get_optional(self, trace_id: TraceId, span_id: SpanId) -> SpanRecord | None:
+        key = self._key(trace_id, span_id)
+        async with self._lock:
+            return self._records.get(key)
+
+    async def list(self, filter: SpanFilter | None = None) -> tuple[SpanRecord, ...]:
+        filter = self._filter(filter)
+        async with self._lock:
+            records = tuple(self._records.values())
+        return self._select(records, filter)
+
+    async def count(self, filter: SpanFilter | None = None) -> int:
+        filter = self._filter(filter)
+        async with self._lock:
+            records = tuple(self._records.values())
+        return len(self._select(records, filter, paginate=False))
+
+    async def snapshot(self, filter: SpanFilter | None = None) -> SpanRepositorySnapshot:
+        filter = self._filter(filter)
+        async with self._lock:
+            records = tuple(self._records.values())
+            status = SpanRepositoryStatus(
+                len(records), self._maximum_records, self._closed, self._created_at
+            )
+        collected_at = _repository_aware(self._clock(), "collected_at")
+        if collected_at < self._created_at:
+            raise SpanRepositoryError("Span repository clock precedes creation")
+        return SpanRepositorySnapshot(
+            status, self._select(records, filter), collected_at, filter is not None
+        )
+
+    async def remove(self, trace_id: TraceId, span_id: SpanId) -> bool:
+        key = self._key(trace_id, span_id)
+        async with self._lock:
+            return self._records.pop(key, None) is not None
+
+    async def reset(self, filter: SpanFilter | None = None) -> int:
+        filter = self._filter(filter)
+        async with self._lock:
+            if filter is None:
+                count = len(self._records)
+                self._records.clear()
+                return count
+            selected = self._select(tuple(self._records.values()), filter)
+            keys = tuple((record.context.trace_id, record.context.span_id) for record in selected)
+            for key in keys:
+                del self._records[key]
+            return len(keys)
+
+    async def status(self) -> SpanRepositoryStatus:
+        async with self._lock:
+            return SpanRepositoryStatus(
+                len(self._records), self._maximum_records, self._closed, self._created_at
+            )
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class SpanProcessorStatus:
+    received_count: int
+    processed_count: int
+    failed_count: int
+    in_flight_count: int
+    closed: bool
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        counts = (
+            self.received_count,
+            self.processed_count,
+            self.failed_count,
+            self.in_flight_count,
+        )
+        if (
+            any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in counts)
+            or self.processed_count + self.failed_count + self.in_flight_count
+            != self.received_count
+            or not isinstance(self.closed, bool)
+        ):
+            raise SpanProcessorError("Invalid span processor status")
+        if (
+            not isinstance(self.created_at, datetime)
+            or self.created_at.tzinfo is None
+            or self.created_at.utcoffset() is None
+        ):
+            raise SpanProcessorError("Invalid span processor timestamp")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "received_count": self.received_count,
+            "processed_count": self.processed_count,
+            "failed_count": self.failed_count,
+            "in_flight_count": self.in_flight_count,
+            "closed": self.closed,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("closed"), bool)
+                or not isinstance(value.get("created_at"), str)
+            ):
+                raise ValueError
+            names = ("received_count", "processed_count", "failed_count", "in_flight_count")
+            counts = tuple(value[name] for name in names)
+            if any(isinstance(item, bool) or not isinstance(item, int) for item in counts):
+                raise ValueError
+            return cls(
+                cast(int, counts[0]),
+                cast(int, counts[1]),
+                cast(int, counts[2]),
+                cast(int, counts[3]),
+                cast(bool, value["closed"]),
+                datetime.fromisoformat(cast(str, value["created_at"])),
+            )
+        except (KeyError, TypeError, ValueError, SpanProcessorError) as error:
+            raise SpanProcessorError(
+                "Invalid serialized span processor status", cause=error
+            ) from error
+
+
+class SpanProcessor(SpanEndHandler, Protocol):
+    async def on_end(self, record: SpanRecord) -> None: ...
+    async def force_flush(self) -> None: ...
+    async def status(self) -> SpanProcessorStatus: ...
+    async def close(self) -> None: ...
+
+
+class SimpleSpanProcessor:
+    def __init__(
+        self,
+        repository: SpanRepository,
+        *,
+        close_repository: bool = False,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        required = (
+            "add",
+            "get",
+            "get_optional",
+            "list",
+            "count",
+            "snapshot",
+            "remove",
+            "reset",
+            "status",
+            "close",
+        )
+        if repository is None or not all(
+            callable(getattr(repository, name, None)) for name in required
+        ):
+            raise SpanProcessorError("Invalid span repository")
+        if not isinstance(close_repository, bool) or not callable(clock):
+            raise SpanProcessorError("Invalid span processor configuration")
+        created_at = clock()
+        if (
+            not isinstance(created_at, datetime)
+            or created_at.tzinfo is None
+            or created_at.utcoffset() is None
+        ):
+            raise SpanProcessorError("Invalid span processor timestamp")
+        self._repository = repository
+        self._close_repository = close_repository
+        self._created_at = created_at
+        self._received = self._processed = self._failed = self._in_flight = 0
+        self._closed = False
+        self._repository_close_started = False
+        self._lock = asyncio.Lock()
+        self._drained = asyncio.Event()
+        self._drained.set()
+
+    async def on_end(self, record: SpanRecord) -> None:
+        if not isinstance(record, SpanRecord):
+            raise SpanProcessorError("Invalid span processor record")
+        async with self._lock:
+            if self._closed:
+                raise SpanProcessorClosedError("Span processor is closed")
+            self._received += 1
+            self._in_flight += 1
+            self._drained.clear()
+        failure: BaseException | None = None
+        try:
+            await self._repository.add(record)
+        except BaseException as error:
+            failure = error
+        async with self._lock:
+            self._in_flight -= 1
+            if failure is None:
+                self._processed += 1
+            else:
+                self._failed += 1
+            if self._in_flight == 0:
+                self._drained.set()
+        if failure is not None:
+            if _process_control(failure):
+                raise failure
+            if isinstance(failure, SpanProcessorError):
+                raise failure
+            cause = failure if isinstance(failure, Exception) else None
+            raise SpanProcessorError("Span repository processing failed", cause=cause) from failure
+
+    async def force_flush(self) -> None:
+        await self._drained.wait()
+
+    async def status(self) -> SpanProcessorStatus:
+        async with self._lock:
+            return SpanProcessorStatus(
+                self._received,
+                self._processed,
+                self._failed,
+                self._in_flight,
+                self._closed,
+                self._created_at,
+            )
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+        await self.force_flush()
+        if not self._close_repository:
+            return
+        async with self._lock:
+            if self._repository_close_started:
+                return
+            self._repository_close_started = True
+        try:
+            await self._repository.close()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except Exception as error:
+            raise SpanProcessorError("Span repository close failed", cause=error) from error
 
 
 def _attribute_name(value: object) -> str:

@@ -164,6 +164,26 @@ class SpanCompletionError(TracingError):
     code = "span_completion_error"
 
 
+class SpanProcessorError(TracingError):
+    code = "span_processor_error"
+
+
+class SpanProcessorClosedError(SpanProcessorError):
+    code = "span_processor_closed"
+
+
+class SpanRepositoryError(TracingError):
+    code = "span_repository_error"
+
+
+class SpanRepositoryClosedError(SpanRepositoryError):
+    code = "span_repository_closed"
+
+
+class SpanRepositoryCapacityError(SpanRepositoryError):
+    code = "span_repository_capacity"
+
+
 class MetricsError(ObservabilityError):
     code = "metrics_error"
 
