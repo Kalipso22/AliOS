@@ -97,9 +97,9 @@ def _number(value: int | float) -> int | float:
 
 
 def _integer(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError
-    return int(value)
+    return value
 
 
 def _aware(value: datetime) -> datetime:
@@ -120,8 +120,13 @@ class MetricLabelSet:
 
     @classmethod
     def create(cls, values: Mapping[str, object] | None = None, **kwargs: object) -> Self:
-        if values is not None and set(values).intersection(kwargs):
-            raise MetricValueError("Ambiguous metric label values")
+        if values is not None and not isinstance(values, Mapping):
+            raise MetricValueError("Invalid metric labels")
+        duplicates = sorted(set(values or ()).intersection(kwargs))
+        if duplicates:
+            raise MetricValueError(
+                "Ambiguous metric label values", {"duplicate": ",".join(duplicates)}
+            )
         return cls({**(dict(values) if values is not None else {}), **kwargs})
 
     def __hash__(self) -> int:
@@ -137,8 +142,13 @@ class MetricLabelSet:
         return cls(value)
 
     def with_values(self, values: Mapping[str, object] | None = None, **kwargs: object) -> Self:
-        if values is not None and set(values).intersection(kwargs):
-            raise MetricValueError("Ambiguous metric label values")
+        if values is not None and not isinstance(values, Mapping):
+            raise MetricValueError("Invalid metric labels")
+        duplicates = sorted(set(values or ()).intersection(kwargs))
+        if duplicates:
+            raise MetricValueError(
+                "Ambiguous metric label values", {"duplicate": ",".join(duplicates)}
+            )
         return type(self).create({**self.values, **(dict(values) if values else {}), **kwargs})
 
 
@@ -222,6 +232,8 @@ class MetricDescriptor:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
         try:
+            if not isinstance(value, Mapping):
+                raise ValueError
             labels = value.get("label_names", ())
             name = value.get("name")
             kind = value.get("kind")
@@ -239,7 +251,7 @@ class MetricDescriptor:
                 or not isinstance(description, str)
             ):
                 raise ValueError
-            if isinstance(maximum_series, bool) or not isinstance(maximum_series, (int, str)):
+            if isinstance(maximum_series, bool) or not isinstance(maximum_series, int):
                 raise ValueError
             if boundaries is not None and (
                 not isinstance(boundaries, (tuple, list))
@@ -255,11 +267,21 @@ class MetricDescriptor:
                 description,
                 unit,
                 tuple(labels),
-                int(maximum_series),
+                maximum_series,
                 tuple(boundaries) if boundaries is not None else None,
             )
         except (KeyError, TypeError, ValueError, ValidationError) as error:
             raise MetricDefinitionError("Invalid metric descriptor") from error
+
+
+def _validate_label_schema(descriptor: MetricDescriptor, labels: MetricLabelSet) -> None:
+    expected = tuple(sorted(descriptor.label_names))
+    received = tuple(labels.values)
+    if received != expected:
+        raise MetricValueError(
+            "Metric label schema mismatch",
+            {"expected": list(expected), "received": list(received)},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +298,9 @@ class MetricPoint:
             self.labels, MetricLabelSet
         ):
             raise MetricValueError("Invalid metric point")
+        if self.descriptor.kind not in (MetricKind.COUNTER, MetricKind.GAUGE):
+            raise MetricValueError("Invalid metric point")
+        _validate_label_schema(self.descriptor, self.labels)
         object.__setattr__(self, "value", _number(self.value))
         _aware(self.created_at)
         _aware(self.updated_at)
@@ -299,13 +324,15 @@ class MetricPoint:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
-        descriptor = value.get("descriptor")
-        labels = value.get("labels")
-        created_at = value.get("created_at")
-        updated_at = value.get("updated_at")
-        raw_value = value.get("value")
-        update_count = value.get("update_count")
         try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+            descriptor = value.get("descriptor")
+            labels = value.get("labels")
+            created_at = value.get("created_at")
+            updated_at = value.get("updated_at")
+            raw_value = value.get("value")
+            update_count = value.get("update_count")
             if (
                 not isinstance(descriptor, Mapping)
                 or not isinstance(labels, Mapping)
@@ -348,6 +375,9 @@ class HistogramPoint:
             or not isinstance(self.labels, MetricLabelSet)
         ):
             raise MetricValueError("Invalid histogram point")
+        _validate_label_schema(self.descriptor, self.labels)
+        if not isinstance(self.bucket_counts, tuple):
+            raise MetricValueError("Invalid histogram point")
         boundaries = self.descriptor.histogram_boundaries or ()
         if (
             len(self.bucket_counts) != len(boundaries) + 1
@@ -362,10 +392,11 @@ class HistogramPoint:
             or isinstance(self.count, bool)
             or not isinstance(self.count, int)
             or self.count < 1
+            or any(value > self.count for value in self.bucket_counts)
             or self.bucket_counts[-1] != self.count
         ):
             raise MetricValueError("Invalid histogram point")
-        _number(self.sum)
+        object.__setattr__(self, "sum", _number(self.sum))
         _aware(self.created_at)
         _aware(self.updated_at)
         if (
@@ -391,12 +422,14 @@ class HistogramPoint:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
-        descriptor = value.get("descriptor")
-        labels = value.get("labels")
-        buckets = value.get("bucket_counts")
-        created = value.get("created_at")
-        updated = value.get("updated_at")
         try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+            descriptor = value.get("descriptor")
+            labels = value.get("labels")
+            buckets = value.get("bucket_counts")
+            created = value.get("created_at")
+            updated = value.get("updated_at")
             if (
                 not isinstance(descriptor, Mapping)
                 or not isinstance(labels, Mapping)
@@ -450,6 +483,12 @@ class MetricFilter:
     offset: int = 0
 
     def __post_init__(self) -> None:
+        if self.names is not None and not isinstance(self.names, frozenset | tuple | list | set):
+            raise MetricValueError("Invalid metric filter")
+        if self.kinds is not None and not isinstance(self.kinds, frozenset | tuple | list | set):
+            raise MetricValueError("Invalid metric filter")
+        if not isinstance(self.label_equals, MetricLabelSet):
+            raise MetricValueError("Invalid metric filter")
         names = frozenset(_name(name) for name in (self.names or ())) or None
         kinds = frozenset(self.kinds or ()) or None
         if kinds and not all(isinstance(kind, MetricKind) for kind in kinds):
@@ -465,8 +504,16 @@ class MetricFilter:
             if lower is not None and upper is not None and lower >= upper:
                 raise MetricValueError("Invalid metric filter")
         if (
-            (self.limit is not None and (isinstance(self.limit, bool) or self.limit < 0))
+            (
+                self.limit is not None
+                and (
+                    isinstance(self.limit, bool)
+                    or not isinstance(self.limit, int)
+                    or self.limit < 0
+                )
+            )
             or isinstance(self.offset, bool)
+            or not isinstance(self.offset, int)
             or self.offset < 0
         ):
             raise MetricValueError("Invalid metric filter")
@@ -486,6 +533,67 @@ class MetricFilter:
             and (self.updated_after is None or sample.updated_at > self.updated_after)
             and (self.updated_before is None or sample.updated_at < self.updated_before)
         )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "names": sorted(self.names) if self.names else None,
+            "kinds": sorted(item.value for item in self.kinds) if self.kinds else None,
+            "label_equals": self.label_equals.to_dict(),
+            "created_after": self.created_after.isoformat() if self.created_after else None,
+            "created_before": self.created_before.isoformat() if self.created_before else None,
+            "updated_after": self.updated_after.isoformat() if self.updated_after else None,
+            "updated_before": self.updated_before.isoformat() if self.updated_before else None,
+            "limit": self.limit,
+            "offset": self.offset,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> Self:
+        try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+            names = value.get("names")
+            kinds = value.get("kinds")
+            labels = value.get("label_equals", {})
+            if names is not None and (
+                not isinstance(names, (list, tuple))
+                or not all(isinstance(item, str) for item in names)
+            ):
+                raise ValueError
+            if kinds is not None and (
+                not isinstance(kinds, (list, tuple))
+                or not all(isinstance(item, str) for item in kinds)
+            ):
+                raise ValueError
+            if not isinstance(labels, Mapping):
+                raise ValueError
+
+            def parsed(name: str) -> datetime | None:
+                raw = value.get(name)
+                if raw is None:
+                    return None
+                if not isinstance(raw, str):
+                    raise ValueError
+                return _aware(datetime.fromisoformat(raw))
+
+            limit, offset = value.get("limit"), value.get("offset", 0)
+            if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
+                raise ValueError
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                raise ValueError
+            return cls(
+                frozenset(names) if names else None,
+                frozenset(MetricKind.parse(item) for item in kinds) if kinds else None,
+                MetricLabelSet.from_dict(labels),
+                parsed("created_after"),
+                parsed("created_before"),
+                parsed("updated_after"),
+                parsed("updated_before"),
+                limit,
+                offset,
+            )
+        except (TypeError, ValueError, MetricValueError) as error:
+            raise MetricValueError("Invalid metric filter") from error
 
 
 class MetricInstrument(Protocol):
@@ -512,12 +620,6 @@ class Gauge(MetricInstrument, Protocol):
     async def set(
         self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
     ) -> MetricPoint: ...
-
-
-class Histogram(MetricInstrument, Protocol):
-    async def observe(
-        self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
-    ) -> HistogramPoint: ...
     async def add(
         self, amount: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
     ) -> MetricPoint: ...
@@ -526,14 +628,31 @@ class Histogram(MetricInstrument, Protocol):
     ) -> MetricPoint: ...
 
 
+class Histogram(MetricInstrument, Protocol):
+    async def observe(
+        self, value: int | float, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> HistogramPoint: ...
+
+
 class MetricRegistry(Protocol):
     async def register_counter(self, descriptor: MetricDescriptor) -> Counter: ...
     async def register_gauge(self, descriptor: MetricDescriptor) -> Gauge: ...
     async def register_histogram(self, descriptor: MetricDescriptor) -> Histogram: ...
     async def get(self, name: str) -> MetricInstrument: ...
     async def get_optional(self, name: str) -> MetricInstrument | None: ...
-    async def list_descriptors(self) -> tuple[MetricDescriptor, ...]: ...
-    async def collect(self) -> tuple[MetricPoint, ...]: ...
+    async def get_counter(self, name: str) -> Counter: ...
+    async def get_gauge(self, name: str) -> Gauge: ...
+    async def get_histogram(self, name: str) -> Histogram: ...
+    async def list_descriptors(
+        self, filter: MetricFilter | None = None
+    ) -> tuple[MetricDescriptor, ...]: ...
+    async def collect(self, filter: MetricFilter | None = None) -> tuple[MetricSample, ...]: ...
+    async def snapshot(self, filter: MetricFilter | None = None) -> MetricRegistrySnapshot: ...
+    async def reset(
+        self, name: str, *, labels: MetricLabelSet | Mapping[str, object] | None = None
+    ) -> bool: ...
+    async def reset_all(self, name: str | None = None) -> int: ...
+    async def status(self) -> MetricRegistryStatus: ...
     async def close(self) -> None: ...
 
 
@@ -784,16 +903,40 @@ class MetricRegistrySnapshot:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.status, MetricRegistryStatus)
+            or not isinstance(self.descriptors, tuple)
+            or not isinstance(self.samples, tuple)
             or not all(isinstance(item, MetricDescriptor) for item in self.descriptors)
             or not all(isinstance(item, (MetricPoint, HistogramPoint)) for item in self.samples)
             or not isinstance(self.filtered, bool)
         ):
             raise MetricValueError("Invalid metric registry snapshot")
         _aware(self.collected_at)
+        if self.collected_at < self.status.created_at:
+            raise MetricValueError("Invalid metric registry snapshot")
         names = tuple(item.name for item in self.descriptors)
         if len(set(names)) != len(names) or tuple(sorted(names)) != names:
             raise MetricValueError("Invalid metric registry snapshot")
-        if any(sample.descriptor.name not in names for sample in self.samples):
+        descriptors = {item.name: item for item in self.descriptors}
+        if any(
+            descriptors.get(sample.descriptor.name) != sample.descriptor for sample in self.samples
+        ):
+            raise MetricValueError("Invalid metric registry snapshot")
+        series = tuple(
+            (sample.descriptor.name, tuple(sample.labels.values.items())) for sample in self.samples
+        )
+        if len(set(series)) != len(series):
+            raise MetricValueError("Invalid metric registry snapshot")
+        order = tuple(
+            (
+                sample.descriptor.name,
+                tuple(sample.labels.values.items()),
+                sample.descriptor.kind.value,
+            )
+            for sample in self.samples
+        )
+        if order != tuple(sorted(order)):
+            raise MetricValueError("Invalid metric registry snapshot")
+        if not self.filtered and len(self.descriptors) != self.status.instrument_count:
             raise MetricValueError("Invalid metric registry snapshot")
 
     def to_dict(self) -> dict[str, object]:
@@ -814,12 +957,14 @@ class MetricRegistrySnapshot:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> Self:
-        status = value.get("status")
-        descriptors = value.get("descriptors")
-        samples = value.get("samples")
-        collected = value.get("collected_at")
-        filtered = value.get("filtered", False)
         try:
+            if not isinstance(value, Mapping):
+                raise ValueError
+            status = value.get("status")
+            descriptors = value.get("descriptors")
+            samples = value.get("samples")
+            collected = value.get("collected_at")
+            filtered = value.get("filtered", False)
             if (
                 not isinstance(status, Mapping)
                 or not isinstance(descriptors, (list, tuple))
@@ -1071,10 +1216,16 @@ class InMemoryMetricRegistry:
 
     async def snapshot(self, filter: MetricFilter | None = None) -> MetricRegistrySnapshot:
         status = await self.status()
-        descriptors = await self.list_descriptors(filter)
+        async with self._lock:
+            descriptors = tuple(self._items[name].descriptor for name in sorted(self._items))
+        if filter is not None:
+            descriptors = tuple(
+                descriptor
+                for descriptor in descriptors
+                if (filter.names is None or descriptor.name in filter.names)
+                and (filter.kinds is None or descriptor.kind in filter.kinds)
+            )
         samples = await self.collect(filter)
-        selected_names = frozenset(item.name for item in descriptors)
-        samples = tuple(sample for sample in samples if sample.descriptor.name in selected_names)
         collected_at = _aware(self._clock())
         if collected_at < self._created_at:
             raise MetricValueError("Metric clock moved backwards")
